@@ -39,7 +39,6 @@ class BaseMujocoTask(ABC):
         self,
         env: BaseMujocoEnv,
         exp_config: "MlSpacesExpConfig",
-        sensor_suite: SensorSuite | None = None,
     ) -> None:
         self._env = env
         self._ctrl_dt_ms = exp_config.ctrl_dt_ms
@@ -60,10 +59,11 @@ class BaseMujocoTask(ABC):
         self.viewer = None  # placeholder to attach interactive viewer
         self.frozen_config = None
 
-        # TODO(rose): disallow passing in sensor suite OR switch to just doing that. probably the latter
-        if sensor_suite is None and exp_config.task_config.use_sensors:
-            sensor_suite = self._create_sensor_suite_from_config(exp_config)
-        self._sensor_suite = sensor_suite
+        if exp_config.task_config.use_sensors:
+            self._sensor_suite = self._create_sensor_suite_from_config(exp_config)
+            self._sensor_suite.extend(self._env.current_robot.create_robot_sensors())
+        else:
+            self._sensor_suite = None
 
         # Action tracking for ActionSensors - the most recent action dict
         self.last_action: dict[str, Any] | None = None
@@ -161,14 +161,25 @@ class BaseMujocoTask(ABC):
 
         return objects
 
+    @abstractmethod
     def _create_sensor_suite_from_config(self, exp_config) -> SensorSuite:
-        # TODO(rose): probably have this api and then move the usage out of the class - do it later though
+        """
+        Create a sensor suite with task-specific sensors.
+        Robot-specific sensors should not be added here.
+        """
         raise NotImplementedError
 
     def register_policy(self, policy: "BasePolicy") -> None:
-        """Register a policy with the task for completion tracking and phase sensing."""
+        """
+        Register a policy with the task for completion tracking and phase sensing.
+        This should only be called once in the task's lifetime.
+        """
+        if self._registered_policy is not None:
+            raise ValueError("Policy already registered")
         self._registered_policy = policy
         policy.task = self
+        if self._sensor_suite is not None:
+            self._sensor_suite.extend(policy.create_policy_sensors())
 
     def num_steps_taken(self) -> int:
         """Get the number of steps taken in the current episode."""
@@ -441,8 +452,12 @@ class BaseMujocoTask(ABC):
             "referral_expressions": self.get_referral_expressions(),
         }
         if self._registered_policy is not None:
-            phases_dict = self._registered_policy.get_all_phases()
-            obs_scene["policy_phases"] = phases_dict
+            from molmo_spaces.policy.base_policy import PlannerPolicy
+
+            # A bit of a hack - why do we need phases in the obs_scene?
+            if isinstance(self._registered_policy, PlannerPolicy):
+                phases_dict = self._registered_policy.get_all_phases()
+                obs_scene["policy_phases"] = phases_dict
             obs_scene.update(self._registered_policy.get_info())
 
         if self.frozen_config is not None:
