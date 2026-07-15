@@ -2,6 +2,7 @@
 
 import logging
 import re
+import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -208,6 +209,10 @@ def compose_episode_videos(
             success_suffix = "_success" if success_status[episode_key] else "_failed"
 
         output_path = output_dir / f"{episode_key.replace('/', '_')}_composed{success_suffix}.mp4"
+        if output_path.exists():
+            # Already composed by an earlier (e.g. live/incremental) pass.
+            composed_paths[episode_key] = output_path
+            continue
         result = compose_videos_side_by_side(video_paths, output_path)
         if result:
             composed_paths[episode_key] = result
@@ -325,6 +330,35 @@ def create_video_results_table(
         log.info(f"Uploaded {table_name} with {len(table_data)} episodes")
 
 
+def _build_video_table_rows(
+    results: list[EpisodeResult],
+    composed_videos: dict[str, Path],
+) -> list[dict]:
+    """Build create_video_results_table() row dicts from results + composed video paths."""
+    result_by_key = {f"{r.house_id}/episode_{r.episode_idx:08d}": r for r in results}
+
+    episode_data = []
+    for episode_key in sorted(composed_videos.keys()):
+        result = result_by_key.get(episode_key)
+        if result is None:
+            continue
+
+        episode_data.append(
+            {
+                "video_path": composed_videos[episode_key],
+                "task_description": result.task_description or "",
+                "object_name": result.object_name or "",
+                "house_id": result.house_id,
+                "episode_idx": result.episode_idx,
+                "num_steps": result.num_steps,
+                "success": result.success,
+                "oracle_done": result.oracle_done,
+                "source_episode_path": result.metadata.get("source_h5_file", ""),
+            }
+        )
+    return episode_data
+
+
 def log_eval_results_to_wandb(
     results: list[EpisodeResult],
     composed_videos: dict[str, Path] | None = None,
@@ -367,34 +401,108 @@ def log_eval_results_to_wandb(
         house_table = wandb.Table(data=house_data, columns=["house_id", "success_rate"])
         wandb.log({"eval/house_success_rates": house_table})
 
-    # Build result lookup by episode key
-    result_by_key = {f"{r.house_id}/episode_{r.episode_idx:08d}": r for r in results}
-
     # Create video table with composed videos and metadata
     if composed_videos:
-        # Convert EpisodeResult objects to dicts for the shared utility
-        episode_data = []
-        for episode_key in sorted(composed_videos.keys()):
-            video_path = composed_videos[episode_key]
-            result = result_by_key.get(episode_key)
-            if result is None:
-                continue
+        create_video_results_table(_build_video_table_rows(results, composed_videos))
 
-            episode_data.append(
-                {
-                    "video_path": video_path,
-                    "task_description": result.task_description or "",
-                    "object_name": result.object_name or "",
-                    "house_id": result.house_id,
-                    "episode_idx": result.episode_idx,
-                    "num_steps": result.num_steps,
-                    "success": result.success,
-                    "oracle_done": result.oracle_done,
-                    "source_episode_path": result.metadata.get("source_h5_file", ""),
-                }
+
+class LiveEvalWandbLogger:
+    """Streams in-progress evaluation results to wandb while the benchmark is still running.
+
+    JsonEvalRunner writes each house's trajectories (and videos) to disk as soon as that
+    house finishes, well before the full benchmark completes. This periodically re-scans
+    the output directory in a background thread and logs the running success rate plus
+    any newly-finished episode videos, so a run in progress shows a live-updating chart
+    and video gallery instead of only reporting once at the very end.
+
+    Usage:
+        live_logger = LiveEvalWandbLogger(output_dir, camera_names, poll_interval_sec=30.0)
+        live_logger.start()
+        ... run the (blocking) evaluation ...
+        live_logger.stop()
+    """
+
+    def __init__(
+        self,
+        output_dir: Path,
+        camera_names: list[str] | None,
+        poll_interval_sec: float = 30.0,
+    ) -> None:
+        self.output_dir = output_dir
+        self.camera_names = camera_names or []
+        self.poll_interval_sec = poll_interval_sec
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._last_total_logged = -1
+
+    @staticmethod
+    def _episode_key(r: EpisodeResult) -> str:
+        return f"{r.house_id}/episode_{r.episode_idx:08d}"
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop the background poller and do one final catch-up poll."""
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join()
+        self._poll_once()
+
+    def _run_loop(self) -> None:
+        while not self._stop_event.wait(self.poll_interval_sec):
+            self._poll_once()
+
+    def _poll_once(self) -> None:
+        import wandb
+
+        try:
+            results = collect_episode_results(self.output_dir)
+        except Exception:
+            log.exception("Live eval wandb logging: failed to collect episode results")
+            return
+
+        if not results:
+            return
+
+        stats = compute_eval_stats(results)
+        if stats["total_episodes"] == self._last_total_logged:
+            # Nothing new finished since the last poll.
+            return
+        self._last_total_logged = stats["total_episodes"]
+
+        wandb.log(
+            {
+                "eval_live/success_rate": stats["success_rate"],
+                "eval_live/success_count": stats["success_count"],
+                "eval_live/episodes_done": stats["total_episodes"],
+                "eval_live/avg_episode_length": stats["avg_episode_length"],
+            },
+            step=stats["total_episodes"],
+        )
+
+        if not self.camera_names:
+            return
+
+        success_status = {self._episode_key(r): r.success for r in results}
+        try:
+            # compose_episode_videos() skips episodes already composed on a prior
+            # poll, so re-running it over the full result set each time is cheap.
+            composed = compose_episode_videos(
+                eval_dir=self.output_dir,
+                camera_names=self.camera_names,
+                success_status=success_status,
             )
+        except Exception:
+            log.exception("Live eval wandb logging: failed to compose episode videos")
+            return
 
-        create_video_results_table(episode_data)
+        if composed:
+            create_video_results_table(
+                _build_video_table_rows(results, composed),
+                table_name="eval_live/video_results",
+            )
 
 
 def log_eval_videos_to_wandb(eval_dir: Path, camera_names: list[str], epoch: int):
@@ -481,7 +589,15 @@ def collect_episode_results(output_dir: Path) -> list[EpisodeResult]:
 
         # Find HDF5 files in this house directory
         for hdf5_path in sorted(house_dir.glob("trajectories*.h5")):
-            with h5py.File(hdf5_path, "r") as f:
+            try:
+                f = h5py.File(hdf5_path, "r")
+            except OSError:
+                # File is still being written by a worker process (e.g. when
+                # polling for live progress mid-run). Skip it for now; it will
+                # be picked up on a later poll once the worker closes it.
+                log.debug(f"Skipping in-progress trajectory file: {hdf5_path}")
+                continue
+            with f:
                 for traj_key in sorted(f.keys()):
                     if not traj_key.startswith("traj_"):
                         continue

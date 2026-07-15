@@ -54,6 +54,7 @@ from molmo_spaces.evaluation.json_eval_runner import JsonEvalRunner
 from molmo_spaces.molmo_spaces_constants import DATA_TYPE_TO_SOURCE_TO_VERSION
 from molmo_spaces.utils.eval_utils import (
     EpisodeResult,
+    LiveEvalWandbLogger,
     collect_episode_results,
     compose_episode_videos,
     log_eval_results_to_wandb,
@@ -216,6 +217,14 @@ def get_args():
         "--no_wandb",
         action="store_true",
         help="Disable wandb logging.",
+    )
+    parser.add_argument(
+        "--wandb_live_interval_sec",
+        type=float,
+        default=30.0,
+        help="How often (in seconds) to poll in-progress results and stream the running "
+        "success rate and newly-finished episode videos to wandb while the benchmark is "
+        "still running. Set to 0 to disable live updates and only log once at the end.",
     )
     parser.add_argument(
         "--use-filament",
@@ -452,6 +461,7 @@ def run_evaluation(
     num_workers: int = 1,
     use_wandb: bool = False,
     wandb_project: str = "mlspaces-online-eval",
+    wandb_live_interval_sec: float = 30.0,
     preloaded_policy: BasePolicy | None = None,
     max_episodes: int | None = None,
     camera_config_override: Any | None = None,
@@ -478,6 +488,9 @@ def run_evaluation(
         num_workers: Number of parallel worker processes.
         use_wandb: Whether to log results to Weights & Biases.
         wandb_project: W&B project name (only used if use_wandb=True).
+        wandb_live_interval_sec: How often (seconds) to poll in-progress results and stream
+            the running success rate and newly-finished episode videos to wandb while the
+            benchmark is still running. Set to 0 to disable and only log once at the end.
         preloaded_policy: Optional pre-initialized policy instance. If provided, skips
             policy creation from config.
         max_episodes: Maximum number of episodes to evaluate from benchmark. If None, evaluates all episodes.
@@ -671,15 +684,26 @@ def run_evaluation(
             }
         )
 
-    # # Run evaluation
-    # runner = JsonEvalRunner(exp_config, benchmark_dir)
-    # success_count, total_count = runner.run(preloaded_policy=policy)
+    # Start live progress logging (running success rate + newly-finished episode videos)
+    # so wandb updates while the benchmark is still running, not just at the end.
+    live_logger: LiveEvalWandbLogger | None = None
+    if use_wandb and wandb_live_interval_sec > 0:
+        live_logger = LiveEvalWandbLogger(
+            output_dir=resolved_output_dir,
+            camera_names=getattr(exp_config.policy_config, "camera_names", []),
+            poll_interval_sec=wandb_live_interval_sec,
+        )
+        live_logger.start()
 
     # Run evaluation
     # Only pass preloaded policy for single-worker mode. With multiple workers,
     # each worker must create its own connection (WebSocket/msgpack can't be pickled).
-    runner = JsonEvalRunner(exp_config, benchmark_dir)
-    success_count, total_count = runner.run(preloaded_policy=preloaded_policy)
+    try:
+        runner = JsonEvalRunner(exp_config, benchmark_dir)
+        success_count, total_count = runner.run(preloaded_policy=preloaded_policy)
+    finally:
+        if live_logger is not None:
+            live_logger.stop()
 
     # Collect per-episode results
     episode_results = collect_episode_results(resolved_output_dir)
@@ -745,6 +769,7 @@ def main() -> None:
         num_workers=args.num_workers,
         use_wandb=not args.no_wandb,
         wandb_project=args.wandb_project,
+        wandb_live_interval_sec=args.wandb_live_interval_sec,
         max_episodes=args.max_episodes,
         environment_light_intensity=args.environment_light_intensity,
         camera_config_override=eval_camera_config,
