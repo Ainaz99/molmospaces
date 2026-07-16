@@ -195,7 +195,14 @@ class PickAndPlaceTask(BaseMujocoTask):
             tilt_displacement = np.arccos(cos_tilt)
 
             # Check that the robot has released the object (no robot-object contact).
-            robot_root_body_id = self._env.current_robot.robot_view.base.root_body_id
+            # NOTE: robot_view.base.root_body_id is the "base" body itself, which is not
+            # necessarily the model's true kinematic root (e.g. for RBY1 it's a child of a
+            # wrapper "robot_0/" body) - body_rootid[...] resolves it to the actual root, so
+            # it matches body_rootid[geom_bodyid[...]] below. Without this, other_root_body
+            # never matches and ongoing robot-object contact is never detected as such.
+            robot_root_body_id = data.model.body_rootid[
+                self._env.current_robot.robot_view.base.root_body_id
+            ]
             robot_contact = False
             for c in data.contact:
                 root_body1 = data.model.body_rootid[data.model.geom_bodyid[c.geom1]]

@@ -308,6 +308,53 @@ def get_supporting_geom(
     return None
 
 
+def compute_grasp_state(
+    data: MjData,
+    object_geoms: set[int],
+    gripper_geoms: dict[str, list[int]],
+) -> dict[str, dict[str, bool]]:
+    """
+    Classify each gripper's contact with an object.
+
+    "touching" means the gripper's own geoms are in contact with the object.
+    "held" additionally requires that the object has no contact with anything else at
+    all (not just this gripper) - including other robot geoms like the arm, torso, or
+    base, which share the gripper's kinematic root and so can't be told apart from it
+    by a root-body comparison alone.
+
+    Args:
+        data: MjData object
+        object_geoms: geom ids belonging to the object
+        gripper_geoms: mapping from gripper/move-group id to its geom ids
+
+    Returns:
+        dict mapping gripper id to {"touching": bool, "held": bool}
+    """
+    held = True
+    gripper_touching = {gripper_id: False for gripper_id in gripper_geoms}
+
+    for cid in range(data.ncon):
+        c = data.contact[cid]
+
+        # skip contacts between the object and itself and contacts not involving the object
+        if (c.geom1 in object_geoms) == (c.geom2 in object_geoms):
+            continue
+
+        other_geom = c.geom2 if c.geom1 in object_geoms else c.geom1
+        for gripper_id, geoms in gripper_geoms.items():
+            if other_geom in geoms:
+                gripper_touching[gripper_id] = True
+                break
+        else:
+            # object is in contact with a non-gripper geom, so it is not held
+            held = False
+
+    return {
+        gripper_id: {"touching": touching, "held": held and touching}
+        for gripper_id, touching in gripper_touching.items()
+    }
+
+
 def is_object_supported_by_body(
     data: MjData,
     object_id: int,

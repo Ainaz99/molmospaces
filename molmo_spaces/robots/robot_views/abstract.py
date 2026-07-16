@@ -232,6 +232,11 @@ class MoveGroup(ABC):
         return self._root_body_id
 
     @property
+    def joint_ids(self) -> list[int]:
+        """The IDs of the joints belonging to this move group."""
+        return self._joint_ids
+
+    @property
     @abstractmethod
     def leaf_frame_to_world(self) -> np.ndarray:
         raise NotImplementedError
@@ -345,10 +350,6 @@ class SimplyActuatedMoveGroup(MoveGroup):
     """
     A SimplyActuatedMoveGroup is a move group with a 1:1 mapping between joints, actuators, and position/velocity addresses.
     """
-
-    @property
-    def joint_ids(self):
-        return self._joint_ids
 
     @property
     def actuator_ids(self):

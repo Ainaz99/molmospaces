@@ -17,7 +17,8 @@ from molmo_spaces.robots.abstract import Robot
 from molmo_spaces.tasks.task import BaseMujocoTask
 from molmo_spaces.utils.camera_utils import erode_segmentation_mask, normalize_points
 from molmo_spaces.utils.linalg_utils import transform_to_twist
-from molmo_spaces.utils.mj_model_and_data_utils import descendant_geoms
+from molmo_spaces.utils.mj_model_and_data_utils import descendant_geoms, move_group_geoms
+from molmo_spaces.utils.mujoco_scene_utils import compute_grasp_state
 from molmo_spaces.utils.pose import pose_mat_to_7d
 
 log = logging.getLogger(__name__)
@@ -496,8 +497,8 @@ class GraspStateSensor(Sensor):
             self._gripper_geoms = {}
             for mg_id in robot_view.get_gripper_movegroup_ids():
                 mg = robot_view.get_move_group(mg_id)
-                self._gripper_geoms[mg_id] = descendant_geoms(
-                    env.mj_model, mg.root_body_id, visible_only=False
+                self._gripper_geoms[mg_id] = move_group_geoms(
+                    env.mj_model, mg.root_body_id, mg.joint_ids, visible_only=False
                 )
 
         if self._object_geoms is None:
@@ -506,33 +507,9 @@ class GraspStateSensor(Sensor):
                 descendant_geoms(model, object_body.body_id, visible_only=False)
             )
 
-        held = True
-        gripper_touching = {k: False for k in self._gripper_geoms}
-
-        for cid in range(env.mj_datas[batch_index].ncon):
-            c = env.mj_datas[batch_index].contact[cid]
-
-            # skip contacts between the object and itself and contacts not involving the object
-            if (c.geom1 in self._object_geoms) == (c.geom2 in self._object_geoms):
-                continue
-
-            other_geom = c.geom2 if c.geom1 in self._object_geoms else c.geom1
-            for gripper_id, gripper_geoms in self._gripper_geoms.items():
-                if other_geom in gripper_geoms:
-                    gripper_touching[gripper_id] = True
-                    break
-            else:
-                # object is in contact with a non-gripper geom, so it is not held
-                held = False
-
-        grasp_state = {}
-        for gripper_id, touching in gripper_touching.items():
-            grasp_state[gripper_id] = {
-                "touching": touching,
-                "held": held and touching,
-            }
-
-        return grasp_state
+        return compute_grasp_state(
+            env.mj_datas[batch_index], self._object_geoms, self._gripper_geoms
+        )
 
 
 class TaskInfoSensor(Sensor):

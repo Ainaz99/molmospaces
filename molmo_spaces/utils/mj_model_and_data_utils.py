@@ -64,6 +64,36 @@ def descendant_geoms(model: MjModel, body_id: int, visible_only: bool = True) ->
     return geoms.tolist()
 
 
+def move_group_geoms(
+    model: MjModel, root_body_id: int, joint_ids: list[int], visible_only: bool = True
+) -> list[int]:
+    """
+    Get all geoms belonging to a move group: descendants of its root body, plus
+    descendants of whichever body each of its own joints is defined on.
+
+    The second part matters for move groups whose actuated sub-parts are XML
+    siblings of the nominal root rather than descendants of it - e.g. RBY1's
+    gripper fingers (each with its own finger joint) are modeled as siblings of
+    the gripper's EE_BODY, not children of it, so descendant_geoms(EE_BODY) alone
+    misses them entirely.
+
+    Args:
+        model (MjModel): The MuJoCo model to use.
+        root_body_id (int): The move group's nominal root body id.
+        joint_ids (list[int]): The move group's own joint ids.
+        visible_only (bool): Whether to only include visible geoms (groups 0-2).
+
+    Returns:
+        list[int]: A sorted list of geom ids belonging to the move group.
+    """
+    geoms = set(descendant_geoms(model, root_body_id, visible_only=visible_only))
+    for jid in joint_ids:
+        geoms.update(
+            descendant_geoms(model, model.jnt_bodyid[jid], visible_only=visible_only)
+        )
+    return sorted(geoms)
+
+
 def body_aabb(
     model: mujoco.MjModel, data: mujoco.MjData, body_id: int, visible_only: bool = True
 ) -> tuple[np.ndarray, np.ndarray]:

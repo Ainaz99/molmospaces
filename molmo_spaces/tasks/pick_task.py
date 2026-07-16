@@ -15,8 +15,8 @@ from molmo_spaces.env.sensors import (
     ObjectStartPoseSensor,
 )
 from molmo_spaces.tasks.task import BaseMujocoTask
-from molmo_spaces.utils.mj_model_and_data_utils import descendant_geoms
-from molmo_spaces.utils.mujoco_scene_utils import get_supporting_geom
+from molmo_spaces.utils.mj_model_and_data_utils import descendant_geoms, move_group_geoms
+from molmo_spaces.utils.mujoco_scene_utils import compute_grasp_state, get_supporting_geom
 
 log = logging.getLogger(__name__)
 
@@ -134,40 +134,29 @@ class PickTask(BaseMujocoTask):
             # Would like to cache this, but no easy way atm
             lift_height = pickup_obj.position[2] - self.config.task_config.pickup_obj_start_pose[2]
 
-            # Option 1: go via descendant geoms and check if all contacts are with robot geoms (didn't work)
-            # obj_geoms = get_supporting_geom(data, pickup_obj.body_id)
-            # robot_geoms = descendant_geoms(self.env._mj_model, self.env.current_robot.robot_view.base.root_body_id)
-            # gripper_root_body_id = self.env.current_robot.robot_view.get_gripper("gripper").root_body_id
-            # gripper_geoms = descendant_geoms(self.env._mj_model, gripper_root_body_id)
-            # for c in data.contact:
-            #     if (c.geom[0] in obj_geoms) ^ (c.geom[1] in obj_geoms):
-            #         other_geom_id = c.geom[1] if c.geom[0] in obj_geoms else c.geom[0]
-            #         if other_geom_id in robot_geoms:
-            #             only_robot_collision = True
-            #         else:
-            #             only_robot_collision = False
-            #             break
-
-            # Option 2: go via root body and check if all contacts are with robot geoms
-            # Check if object collides only with robot geoms
-            robot_collision = False
-            non_robot_collision = False
-            for c in data.contact:
-                root_body1 = data.model.body_rootid[data.model.geom_bodyid[c.geom1]]
-                root_body2 = data.model.body_rootid[data.model.geom_bodyid[c.geom2]]
-                if (root_body1 == pickup_obj.body_id) ^ (root_body2 == pickup_obj.body_id):
-                    other_root_body = root_body1 if root_body1 != pickup_obj.body_id else root_body2
-                    if other_root_body == self.env.current_robot.robot_view.base.root_body_id:
-                        robot_collision = True
-                    else:
-                        non_robot_collision = True
-                        break  # no need to keep checking if we already know there's a non-robot collision
-
-            only_robot_collision = robot_collision and not non_robot_collision
+            # Whether the object is held: in contact with a gripper and nothing else.
+            # NOTE: a root-body comparison (comparing body_rootid[geom_bodyid[...]] against
+            # the robot's root) can't tell "held by the gripper" apart from "resting against
+            # the arm/torso/base" - on RBY1 those all share the same kinematic root as the
+            # gripper, so any incidental non-gripper contact was previously misclassified as
+            # a successful grasp. Use the same gripper-geom-specific classification as
+            # GraspStateSensor instead of a root-body comparison.
+            robot_view = self.env.current_robot.robot_view
+            gripper_geoms = {}
+            for mg_id in robot_view.get_gripper_movegroup_ids():
+                mg = robot_view.get_move_group(mg_id)
+                gripper_geoms[mg_id] = move_group_geoms(
+                    self.env._mj_model, mg.root_body_id, mg.joint_ids, visible_only=False
+                )
+            object_geoms = set(
+                descendant_geoms(self.env._mj_model, pickup_obj.body_id, visible_only=False)
+            )
+            grasp_state = compute_grasp_state(data, object_geoms, gripper_geoms)
+            held_by_gripper = any(gripper["held"] for gripper in grasp_state.values())
 
             # Success check
             success = (
-                only_robot_collision and lift_height >= self.config.task_config.succ_pos_threshold
+                held_by_gripper and lift_height >= self.config.task_config.succ_pos_threshold
                 # and rot_error < self.config.task_config.succ_rot_threshold
             )
 
