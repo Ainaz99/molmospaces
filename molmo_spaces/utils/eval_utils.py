@@ -42,6 +42,13 @@ class EpisodeResult:
     seed: int | None = None
     data_file_path: Path | None = None
     oracle_done: bool | None = None
+    bbox_mode: str | None = None
+    """Bbox conditioning mode ("fourier"/"crop"/"both"/"overlay") the policy used
+    this episode, if any. Set from obs_scene["bbox_mode"] (see policy.get_info())."""
+    bbox_viz_path: Path | None = None
+    """Path to a saved PNG preview of the bbox conditioning for this episode
+    (crop for "crop"/"both", box-drawn-on-frame for "overlay"/"fourier"), decoded
+    from obs_scene["bbox_viz_png_b64"] by collect_episode_results()."""
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -285,6 +292,11 @@ def create_video_results_table(
         - success: Boolean success status (at end of episode)
         - oracle_done: Boolean, success at ANY point during episode (optional)
         - source_episode_path: Original episode path (optional, for provenance)
+        - bbox_mode: Bbox conditioning mode used ("fourier"/"crop"/"both"/"overlay"),
+          if the policy set one (optional)
+        - bbox_viz_path: Path to a PNG preview of the bbox conditioning for this
+          episode - crop for "crop"/"both", box-drawn-on-frame for "overlay"/"fourier"
+          (optional)
 
     Args:
         episode_data: List of dicts with video paths and metadata
@@ -298,6 +310,13 @@ def create_video_results_table(
         if video_path is None or not Path(video_path).exists():
             continue
 
+        bbox_viz_path = ep.get("bbox_viz_path")
+        bbox_viz_image = (
+            wandb.Image(str(bbox_viz_path))
+            if bbox_viz_path and Path(bbox_viz_path).exists()
+            else None
+        )
+
         row = [
             wandb.Video(str(video_path), format="mp4"),
             ep.get("task_description", ""),
@@ -308,6 +327,8 @@ def create_video_results_table(
             "Success" if ep.get("success") else "Failed",
             "Yes" if ep.get("oracle_done") else "No",
             ep.get("source_episode_path", ""),
+            ep.get("bbox_mode", ""),
+            bbox_viz_image,
         ]
         table_data.append(row)
 
@@ -324,6 +345,8 @@ def create_video_results_table(
                 "result",
                 "oracle_done",
                 "source_episode_path",
+                "bbox_mode",
+                "bbox_viz",
             ],
         )
         wandb.log({table_name: video_table})
@@ -354,6 +377,8 @@ def _build_video_table_rows(
                 "success": result.success,
                 "oracle_done": result.oracle_done,
                 "source_episode_path": result.metadata.get("source_h5_file", ""),
+                "bbox_mode": result.bbox_mode or "",
+                "bbox_viz_path": result.bbox_viz_path,
             }
         )
     return episode_data
@@ -625,12 +650,23 @@ def collect_episode_results(output_dir: Path) -> list[EpisodeResult]:
                     # Extract task description from obs_scene
                     task_description = None
                     object_name = None
+                    bbox_mode = None
+                    bbox_viz_path = None
                     if "obs_scene" in traj_group:
                         obs_scene = parse_obs_scene(traj_group["obs_scene"][()])
                         task_description = obs_scene.get("task_description") or obs_scene.get(
                             "text"
                         )
                         object_name = obs_scene.get("object_name")
+                        bbox_mode = obs_scene.get("bbox_mode")
+                        bbox_viz_b64 = obs_scene.get("bbox_viz_png_b64")
+                        if bbox_viz_b64:
+                            import base64
+
+                            viz_dir = output_dir / "bbox_viz"
+                            viz_dir.mkdir(parents=True, exist_ok=True)
+                            bbox_viz_path = viz_dir / f"{house_id}_episode_{episode_idx:08d}.png"
+                            bbox_viz_path.write_bytes(base64.b64decode(bbox_viz_b64))
 
                     results.append(
                         EpisodeResult(
@@ -642,6 +678,8 @@ def collect_episode_results(output_dir: Path) -> list[EpisodeResult]:
                             object_name=object_name,
                             data_file_path=hdf5_path,
                             oracle_done=oracle_done,
+                            bbox_mode=bbox_mode,
+                            bbox_viz_path=bbox_viz_path,
                         )
                     )
 
