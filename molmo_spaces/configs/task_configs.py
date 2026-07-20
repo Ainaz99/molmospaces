@@ -64,6 +64,12 @@ class PickTaskConfig(BaseMujocoTaskConfig):
     succ_pos_threshold: float = 0.01  # lower threshold lift height in meters
     # succ_rot_threshold: float = 0.15  # Rotation success threshold in radians
 
+    # Number of consecutive steps the object must be held-by-gripper-only AND above
+    # succ_pos_threshold before the episode is judged a success. Filters out single-frame
+    # contact flicker (e.g. an unstable grasp still sliding in the gripper) that would
+    # otherwise satisfy the instantaneous check by chance.
+    succ_hold_steps: int = 5
+
     # Rendering settings
     enable_rendering: bool = True  # Whether to enable environment rendering for visual sensors
 

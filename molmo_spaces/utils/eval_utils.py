@@ -49,6 +49,12 @@ class EpisodeResult:
     """Path to a saved PNG preview of the bbox conditioning for this episode
     (crop for "crop"/"both", box-drawn-on-frame for "overlay"/"fourier"), decoded
     from obs_scene["bbox_viz_png_b64"] by collect_episode_results()."""
+    depth_video_path: Path | None = None
+    """Path to this episode's depth-prediction video (see MorpheusPolicy's
+    use_depth_supervision / eval-time visualize_depth) — each depth camera's RGB
+    frame (what the model actually saw) composed side-by-side with its depth
+    prediction. Set from obs_scene["depth_video_paths"]/["depth_rgb_video_paths"]
+    by collect_episode_results()."""
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -297,6 +303,9 @@ def create_video_results_table(
         - bbox_viz_path: Path to a PNG preview of the bbox conditioning for this
           episode - crop for "crop"/"both", box-drawn-on-frame for "overlay"/"fourier"
           (optional)
+        - depth_video_path: Path to a video of the auxiliary depth head's predictions
+          for this episode, if the policy was trained with use_depth_supervision and
+          eval-time depth visualization was enabled (optional)
 
     Args:
         episode_data: List of dicts with video paths and metadata
@@ -317,6 +326,13 @@ def create_video_results_table(
             else None
         )
 
+        depth_video_path = ep.get("depth_video_path")
+        depth_video = (
+            wandb.Video(str(depth_video_path), format="mp4")
+            if depth_video_path and Path(depth_video_path).exists()
+            else None
+        )
+
         row = [
             wandb.Video(str(video_path), format="mp4"),
             ep.get("task_description", ""),
@@ -329,6 +345,7 @@ def create_video_results_table(
             ep.get("source_episode_path", ""),
             ep.get("bbox_mode", ""),
             bbox_viz_image,
+            depth_video,
         ]
         table_data.append(row)
 
@@ -347,6 +364,7 @@ def create_video_results_table(
                 "source_episode_path",
                 "bbox_mode",
                 "bbox_viz",
+                "depth_video",
             ],
         )
         wandb.log({table_name: video_table})
@@ -379,6 +397,7 @@ def _build_video_table_rows(
                 "source_episode_path": result.metadata.get("source_h5_file", ""),
                 "bbox_mode": result.bbox_mode or "",
                 "bbox_viz_path": result.bbox_viz_path,
+                "depth_video_path": result.depth_video_path,
             }
         )
     return episode_data
@@ -652,6 +671,7 @@ def collect_episode_results(output_dir: Path) -> list[EpisodeResult]:
                     object_name = None
                     bbox_mode = None
                     bbox_viz_path = None
+                    depth_video_path = None
                     if "obs_scene" in traj_group:
                         obs_scene = parse_obs_scene(traj_group["obs_scene"][()])
                         task_description = obs_scene.get("task_description") or obs_scene.get(
@@ -668,6 +688,32 @@ def collect_episode_results(output_dir: Path) -> list[EpisodeResult]:
                             bbox_viz_path = viz_dir / f"{house_id}_episode_{episode_idx:08d}.png"
                             bbox_viz_path.write_bytes(base64.b64decode(bbox_viz_b64))
 
+                        depth_video_paths = obs_scene.get("depth_video_paths")
+                        depth_rgb_video_paths = obs_scene.get("depth_rgb_video_paths") or {}
+                        if depth_video_paths:
+                            depth_dir = output_dir / "depth_viz_composed"
+                            final_path = depth_dir / f"{house_id}_episode_{episode_idx:08d}.mp4"
+                            if final_path.exists():
+                                depth_video_path = final_path
+                            else:
+                                cam_paths = []
+                                for cam, depth_p in depth_video_paths.items():
+                                    rgb_p = depth_rgb_video_paths.get(cam)
+                                    if rgb_p and Path(rgb_p).exists():
+                                        cam_paths.append(Path(rgb_p))
+                                    if Path(depth_p).exists():
+                                        cam_paths.append(Path(depth_p))
+                                if cam_paths:
+                                    depth_dir.mkdir(parents=True, exist_ok=True)
+                                    if len(cam_paths) == 1:
+                                        cam_paths[0].rename(final_path)
+                                    else:
+                                        compose_videos_side_by_side(cam_paths, final_path)
+                                        for p in cam_paths:
+                                            p.unlink(missing_ok=True)
+                                    if final_path.exists():
+                                        depth_video_path = final_path
+
                     results.append(
                         EpisodeResult(
                             episode_idx=episode_idx,
@@ -680,6 +726,7 @@ def collect_episode_results(output_dir: Path) -> list[EpisodeResult]:
                             oracle_done=oracle_done,
                             bbox_mode=bbox_mode,
                             bbox_viz_path=bbox_viz_path,
+                            depth_video_path=depth_video_path,
                         )
                     )
 

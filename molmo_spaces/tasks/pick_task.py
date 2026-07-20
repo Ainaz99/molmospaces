@@ -40,6 +40,14 @@ class PickupObjGoalPoseSensor(Sensor):
 class PickTask(BaseMujocoTask):
     """Pick task implementation."""
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._held_streak: dict[int, int] = {}
+
+    def reset(self):
+        self._held_streak = {}
+        return super().reset()
+
     def get_task_description(self) -> str:
         pickup_obj_name = self.config.task_config.referral_expressions["pickup_obj_name"]
         return f"Pick up the {pickup_obj_name}"
@@ -154,11 +162,19 @@ class PickTask(BaseMujocoTask):
             grasp_state = compute_grasp_state(data, object_geoms, gripper_geoms)
             held_by_gripper = any(gripper["held"] for gripper in grasp_state.values())
 
-            # Success check
-            success = (
+            # Require the hold to be sustained for a few consecutive steps rather than
+            # trusting a single instant: a single frame can be a contact-solver blip (an
+            # idle object jittering against the gripper) or just the very first millisecond
+            # of a real lift-off before the grasp has actually stabilized - neither looks
+            # like "picked up" on video, and either can otherwise satisfy the check by luck.
+            meets_criteria = (
                 held_by_gripper and lift_height >= self.config.task_config.succ_pos_threshold
                 # and rot_error < self.config.task_config.succ_rot_threshold
             )
+            self._held_streak[i] = self._held_streak.get(i, 0) + 1 if meets_criteria else 0
+
+            # Success check
+            success = self._held_streak[i] >= self.config.task_config.succ_hold_steps
 
             metrics.append(
                 {
