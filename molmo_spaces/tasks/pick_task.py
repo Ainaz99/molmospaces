@@ -43,9 +43,11 @@ class PickTask(BaseMujocoTask):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._held_streak: dict[int, int] = {}
+        self._ever_succeeded: dict[int, bool] = {}
 
     def reset(self):
         self._held_streak = {}
+        self._ever_succeeded = {}
         return super().reset()
 
     def get_task_description(self) -> str:
@@ -173,8 +175,13 @@ class PickTask(BaseMujocoTask):
             )
             self._held_streak[i] = self._held_streak.get(i, 0) + 1 if meets_criteria else 0
 
-            # Success check
-            success = self._held_streak[i] >= self.config.task_config.succ_hold_steps
+            # Success is sticky: once the object has been stably held for succ_hold_steps
+            # consecutive steps, the pick is judged successful for the rest of the episode
+            # even if the object is dropped afterward (e.g. during a subsequent place/retreat
+            # phase) - a later drop doesn't undo an already-demonstrated successful pick.
+            just_succeeded = self._held_streak[i] >= self.config.task_config.succ_hold_steps
+            self._ever_succeeded[i] = self._ever_succeeded.get(i, False) or just_succeeded
+            success = self._ever_succeeded[i]
 
             metrics.append(
                 {
