@@ -197,15 +197,16 @@ def compose_episode_videos(
     episode_videos = defaultdict(dict)
 
     for cam_name in camera_names:
+        name_pattern = re.compile(rf"episode_(\d+)_{re.escape(cam_name)}(?!_depth|_seg)(?:_.*)?\.mp4$")
         for video_path in eval_dir.glob(f"**/episode_*_{cam_name}*.mp4"):
+            match = name_pattern.match(video_path.name)
+            if not match:
+                continue
             # Extract episode key from path
             house_dir = video_path.parent.name
-            # Parse episode index from filename
-            match = re.match(r"episode_(\d+)_", video_path.name)
-            if match:
-                episode_idx = int(match.group(1))
-                episode_key = f"{house_dir}/episode_{episode_idx:08d}"
-                episode_videos[episode_key][cam_name] = video_path
+            episode_idx = int(match.group(1))
+            episode_key = f"{house_dir}/episode_{episode_idx:08d}"
+            episode_videos[episode_key][cam_name] = video_path
 
     composed_paths = {}
     for episode_key, cam_paths in sorted(episode_videos.items()):

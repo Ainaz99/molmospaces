@@ -53,8 +53,8 @@ if str2bool(os.environ.get("MLSPACES_SINGLE_THREAD_PROCS", "False")):
     single_thread_environment()
 
 ABS_PATH_OF_TOP_LEVEL_MOLMO_SPACES_DIR = Path(__file__).resolve().parent.parent
-
-_DATA_CACHE_DEFAULT = Path("~/.cache/molmo-spaces-resources").expanduser()
+# _DATA_CACHE_DEFAULT = Path("~/.cache/molmo-spaces-resources").expanduser()
+_DATA_CACHE_DEFAULT = Path("/mnt/data/ainaz/cache/molmo-spaces-resources").expanduser()
 DATA_CACHE_DIR = Path(os.environ.get("MLSPACES_CACHE_DIR", _DATA_CACHE_DEFAULT))
 
 # Each molmospaces installation needs its own assets directory.
