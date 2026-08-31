@@ -1248,7 +1248,11 @@ class ObjectManager:
 
         # TODO(Abhay): do we want this?
         for object_name in self._env.config.task_config.added_objects:
-            task_object = create_mlspaces_body(self.data, object_name)
+            try:
+                task_object = create_mlspaces_body(self.data, object_name)
+            except KeyError:
+                log.warning("Could not find added object %s in scene", object_name)
+                continue
             task_objects.append(task_object)
 
         return task_objects

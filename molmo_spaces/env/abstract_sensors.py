@@ -113,6 +113,45 @@ class SensorSuite:
             for uuid, sensor in self.sensors.items()
         }
 
+    def render_requests(self) -> list[tuple[str, str]]:
+        """(camera_name, mode) pairs this suite needs rendered, deduplicated
+        -- mode is one of "rgb"/"depth"/"segmentation", matching
+        CPUMujocoEnv.render_batch's `mode` parameter. Used by
+        BaseMujocoTask.get_observations() to batch-render a whole group of
+        indices' cameras together instead of one call at a time.
+
+        Covers every sensor that ever triggers a render, directly or not:
+        CameraSensor/DepthSensor/SegmentationSensor call env.render_*_frame
+        directly; ObjectImagePointsSensor calls
+        env.get_segmentation_mask_of_object(), which internally calls
+        env.render_segmentation_frame() -- same render, same cache
+        (render_rgb_frame/render_depth_frame/render_segmentation_frame all
+        check CPUMujocoEnv._render_cache before rendering), so pre-warming it
+        here makes that call a cache hit too without ObjectImagePointsSensor
+        needing to know anything about batching."""
+        from molmo_spaces.env.sensors import ObjectImagePointsSensor
+        from molmo_spaces.env.sensors_cameras import CameraSensor, DepthSensor, SegmentationSensor
+
+        seen: set[tuple[str, str]] = set()
+        requests: list[tuple[str, str]] = []
+
+        def _add(key: tuple[str, str]) -> None:
+            if key not in seen:
+                seen.add(key)
+                requests.append(key)
+
+        for sensor in self.sensors.values():
+            if isinstance(sensor, CameraSensor):
+                _add((sensor.camera_name, "rgb"))
+            elif isinstance(sensor, DepthSensor):
+                _add((sensor.camera_name, "depth"))
+            elif isinstance(sensor, SegmentationSensor):
+                _add((sensor.camera_name, "segmentation"))
+            elif isinstance(sensor, ObjectImagePointsSensor):
+                for camera_name in sensor.camera_names:
+                    _add((camera_name, "segmentation"))
+        return requests
+
     def extend(self, sensors: Sequence[Sensor]) -> None:
         """Extend the sensor suite with additional sensors."""
         for sensor in sensors:

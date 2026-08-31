@@ -1,3 +1,4 @@
+import os
 from queue import Queue
 from typing import Any, Literal
 
@@ -79,7 +80,14 @@ class MjOpenGLRenderer(MjAbstractRenderer):
           ValueError: If `camera_id` is outside the valid range, or if `width` or
             `height` exceed the dimensions of MuJoCo's offscreen framebuffer.
         """
-        if device_id is None:
+        # Escape hatch to force pure-CPU rendering (MUJOCO_GL=osmesa) even
+        # when CUDA is available -- e.g. GPU EGL rendering is unstable/
+        # crashing on the current machine's driver. Leaving device_id as
+        # None routes to the branch below that lets mujoco.gl_context pick
+        # the backend from MUJOCO_GL directly, instead of forcing EGL device
+        # 0. Slower (software rasterizer) but touches no GPU/driver state at
+        # all, so none of that instability can occur.
+        if device_id is None and os.environ.get("MOLMO_SPACES_CPU_RENDER", "0") != "1":
             try:
                 import torch
 

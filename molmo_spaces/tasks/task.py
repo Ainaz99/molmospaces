@@ -15,6 +15,7 @@ Action Noise:
 import contextlib
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Collection
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -185,32 +186,85 @@ class BaseMujocoTask(ABC):
         """Get the number of steps taken in the current episode."""
         return self.episode_step_count
 
-    def get_observations(self) -> list[dict[str, Any]]:
-        """Get observations using the sensor suite and accumulate all other information."""
-        observations = []
-        for i in range(self._env.n_batch):
-            if self._sensor_suite is not None:
-                env_obs = self._sensor_suite.get_observations(
-                    env=self._env, task=self, batch_index=i
-                )
-            else:  # allow use_sensors to be False in exp_config
-                env_obs = {}
-            observations.append(env_obs)
+    def get_observations(self, idxs: Collection[int] | None = None) -> list[dict[str, Any]]:
+        """Get observations using the sensor suite and accumulate all other
+        information.
+
+        idxs: render/observe only these batch indices (default: all);
+        every other index gets an empty placeholder instead. Lets a
+        group-batched caller (env_worker.py's group_worker_main) fetch one
+        just-terminated index's final observation without re-rendering
+        every camera for the whole group.
+        """
+        if idxs is None:
+            idxs = range(self._env.n_batch)
+        idxs = list(idxs)
+        observations: list[dict[str, Any]] = [{} for _ in range(self._env.n_batch)]
+        prev_batch_index = self._env.current_batch_index
+        try:
+            # Camera sensors render off env.current_data and the camera
+            # registry's per-index pose, neither of which is itself indexed
+            # by batch on its own -- both must be pointed at env i before
+            # computing i's pose (mirrors env.get_segmentation_mask_of_object's
+            # save/set/restore idiom). Sequential: cheap, CPU-only, and the
+            # thing env.render_batch's own sequential "prepare" phase below
+            # depends on having already run for every idx in this batch.
+            for i in idxs:
+                self._env.current_batch_index = i
+                self._env.camera_manager.registry.update_all_cameras(self._env)
+
+            # One parallel-render round per distinct (camera, mode) this
+            # task's sensors need, covering every idx at once -- replaces
+            # what would otherwise be len(idxs) sequential single-camera
+            # renders. No-op when len(idxs) <= 1 (always true at
+            # n_batch==1, i.e. datagen/eval), so this adds zero overhead
+            # there.
+            if self._sensor_suite is not None and len(idxs) > 1:
+                for camera_name, mode in self._sensor_suite.render_requests():
+                    frames = self._env.render_batch(camera_name, mode, idxs)
+                    for i, frame in frames.items():
+                        self._env._render_cache[(i, camera_name, mode)] = frame
+
+            for i in idxs:
+                self._env.current_batch_index = i
+                if self._sensor_suite is not None:
+                    env_obs = self._sensor_suite.get_observations(
+                        env=self._env, task=self, batch_index=i
+                    )
+                else:  # allow use_sensors to be False in exp_config
+                    env_obs = {}
+                observations[i] = env_obs
+        finally:
+            self._env.current_batch_index = prev_batch_index
+            self._env.clear_render_cache()
         return observations
 
     def get_and_cache_all_step_information(
         self,
+        render: bool = True,
     ) -> tuple[
         list[dict[str, Any]], NDArray[float], NDArray[bool], NDArray[bool], list[dict[str, Any]]
     ]:
-        """Get observations, reward, done, info and cache them."""
-        observation = self.get_observations()
+        """Get observations, reward, done, info and cache them.
+
+        render=False skips get_observations() (camera rendering -- the
+        expensive part of a step, confirmed via CameraSensor/DepthSensor
+        each doing a real, uncached env.render_*_frame() OpenGL/EGL call)
+        and substitutes an empty placeholder per batch env. Reward/
+        terminated/truncated/info/success are always computed straight from
+        physics state (e.g. PickTask.get_reward reads mj_data object
+        position; nothing here reads `observation`), so this is safe
+        whenever the caller doesn't need this particular step's observation.
+        """
+        observation = self.get_observations() if render else [{} for _ in range(self._env.n_batch)]
         reward = self.get_reward()
         terminated = self.is_terminal()
         truncated = self.is_timed_out()
         info = self.get_info()
-        # TODO: do per-environment success tracking, this only does for index 0
-        success = np.full(terminated.shape, fill_value=self.judge_success())
+        # judge_success() may return a scalar (most task types, one global
+        # verdict) or a per-index array (PickTask) -- broadcast so a real
+        # per-index result isn't collapsed down to env 0's value.
+        success = np.broadcast_to(self.judge_success(), terminated.shape)
 
         # cache the inputs and outputs
         self.observation_cache.append(observation)
@@ -221,8 +275,31 @@ class BaseMujocoTask(ABC):
 
         return observation, reward, terminated, truncated, info
 
-    def reset(self):
-        """Reset the task and record initial observations."""
+    def reset(self, render: bool = True):
+        """Reset the task and record initial observations.
+
+        render=False skips the actual camera rendering (the expensive part
+        -- see get_and_cache_all_step_information's own docstring) while
+        still correctly computing and caching everything else (reward/
+        terminated/truncated/info/success, all physics-state-derived,
+        unrelated to whether an observation image was rendered). The
+        returned/cached observation is a placeholder per batch env in that
+        case -- callers that need the real one can fetch it separately via
+        get_observations() once they're ready to pay for it, then patch it
+        into self.observation_cache[-1] (this call's own cache entry) and
+        call self.config.freeze_task_config(real_observation, task=self)
+        themselves -- both deliberately skipped here when render=False,
+        since both need a real observation to be meaningful, not a
+        placeholder. freeze_task_config's own result (self.frozen_config)
+        is read in exactly one place (get_obs_scene, a datagen-only method
+        never called from the RL rollout path), so leaving it unset for the
+        brief window before a caller patches it is safe there.
+
+        Added for group_worker_main's render_lock: reset's CPU-bound scene
+        work (already done by the caller, in task_sampler.
+        sample_specific_episode_batch(), before this runs) shouldn't be
+        serialized across a rank's groups, only the render itself should
+        be."""
         # TODO(rose): Something like this should be done here to be compatible with gym API
         # consider placing settle_scene here.
         # self._env.reset()
@@ -255,14 +332,17 @@ class BaseMujocoTask(ABC):
 
         # get the current obs and return them, to align with the gymnasium API
         # TODO(max) - possibly this should include padding values for reward/terminal/truncated. Prefer to have everything be the same length for alignment, even if padding values are needed
-        observation, reward, terminated, truncated, info = self.get_and_cache_all_step_information()
+        observation, reward, terminated, truncated, info = self.get_and_cache_all_step_information(render=render)
 
-        self.frozen_config = self.config.freeze_task_config(observation, task=self)
+        if render:
+            self.frozen_config = self.config.freeze_task_config(observation, task=self)
         return observation, info
 
     def step(
         self,
         action: dict[str, Any] | list[dict[str, Any]],
+        render: bool = True,
+        active_idxs: Collection[int] | None = None,
     ) -> tuple[
         list[dict[str, Any]], NDArray[float], NDArray[bool], NDArray[bool], list[dict[str, Any]]
     ]:
@@ -271,6 +351,24 @@ class BaseMujocoTask(ABC):
         Args:
             action: Single action dict for single-env mode, or list of action dicts
                 (one per env) for batched mode.
+            render: if False, skip get_observations() (camera rendering -- the
+                expensive part of a step) and return an empty placeholder
+                observation instead. Reward/terminated/truncated/info/success
+                are always computed from physics state directly, never from
+                observations (see e.g. PickTask.get_reward/get_info), so this
+                is safe whenever the caller doesn't need this particular
+                step's observation -- e.g. a macro-step of several raw steps
+                where only the last one's observation is actually consumed.
+            active_idxs: physically advance only these batch indices (default:
+                all). For a group-batched GRPO worker where one index was just
+                placed at a fresh episode start this round while its
+                groupmates are mid-episode (see env_worker.py's
+                group_worker_main), `action[i]` for that index isn't a real
+                policy action at all -- it must not be executed. Reward/
+                terminated/etc. are still computed for every index as usual;
+                the caller is responsible for ignoring/overriding those
+                entries for indices it excluded here (mirroring what a plain
+                "reset" reply already means on the single-env path).
 
         Returns:
             Tuple of (observations, rewards, terminated, truncated, infos)
@@ -329,7 +427,7 @@ class BaseMujocoTask(ABC):
         if np.all(self.is_done()):
             print("Warning: step() called on task where all environments are already done")
             # Return current state without stepping
-            return self.get_and_cache_all_step_information()
+            return self.get_and_cache_all_step_information(render=render)
 
         # Check if any action contains a "done" signal
         for _i, act in enumerate(actions):
@@ -349,7 +447,7 @@ class BaseMujocoTask(ABC):
         for _ in range(self._n_ctrl_steps_per_policy):
             for robot in self._env.robots:
                 robot.compute_control()
-            self._env.step(self._n_sim_steps_per_ctrl)
+            self._env.step(self._n_sim_steps_per_ctrl, idxs=active_idxs)
         if self._datagen_profiler is not None:
             self._datagen_profiler.end("physics_step")
 
@@ -359,7 +457,9 @@ class BaseMujocoTask(ABC):
         # Sensor polling (cameras, proprioception, etc.)
         if self._datagen_profiler is not None:
             self._datagen_profiler.start("sensor_polling")
-        observation, reward, terminated, truncated, info = self.get_and_cache_all_step_information()
+        observation, reward, terminated, truncated, info = self.get_and_cache_all_step_information(
+            render=render
+        )
         if self._datagen_profiler is not None:
             self._datagen_profiler.end("sensor_polling")
 
@@ -384,7 +484,7 @@ class BaseMujocoTask(ABC):
         raise NotImplementedError
 
     def is_timed_out(self) -> NDArray[bool]:
-        return np.array([self.episode_step_count >= self._task_horizon])
+        return np.full(self._env.n_batch, self.episode_step_count >= self._task_horizon)
 
     def is_terminal(self) -> np.ndarray:
         """Check if task is terminal for each environment.
@@ -392,22 +492,18 @@ class BaseMujocoTask(ABC):
         Terminal if a done action was received, or — when ``terminate_upon_success``
         is enabled in the experiment config — the success criterion is met.
         """
-        assert self._env.n_batch == 1, (
-            f"Only single-task batches supported. Got env.n_batch={self._env.n_batch}"
-        )
-
-        terminal = np.zeros(self._env.n_batch, dtype=bool)
-
-        is_success = False
+        is_success = np.zeros(self._env.n_batch, dtype=bool)
         if hasattr(self.config, "terminate_upon_success") and self.config.terminate_upon_success:
-            is_success = self.judge_success()
+            # judge_success() may return a scalar or a per-index array (see
+            # get_and_cache_all_step_information) -- broadcast so each env's
+            # own success gates its own termination, not just env 0's.
+            is_success = np.broadcast_to(self.judge_success(), (self._env.n_batch,))
 
-        terminal[0] = is_success or self._done_action_received
-
-        return terminal
+        return np.logical_or(is_success, self._done_action_received)
 
     @abstractmethod
-    def judge_success(self) -> bool:
+    def judge_success(self) -> bool | np.ndarray:
+        """A single verdict, or one per env for a task that supports batch>1."""
         raise NotImplementedError
 
     def get_referral_expressions(self):

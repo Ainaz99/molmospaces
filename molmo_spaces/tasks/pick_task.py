@@ -45,10 +45,29 @@ class PickTask(BaseMujocoTask):
         self._held_streak: dict[int, int] = {}
         self._ever_succeeded: dict[int, bool] = {}
 
-    def reset(self):
+    def reset(self, render: bool = True):
         self._held_streak = {}
         self._ever_succeeded = {}
-        return super().reset()
+        return super().reset(render=render)
+
+    def reset_index(self, idx: int) -> None:
+        """Clears batch index `idx`'s sticky success-tracking state only --
+        for a mid-iteration per-index auto-reset (one occurrence in an
+        otherwise still-running group finishes early and restarts the same
+        pinned episode; see morpheus/rl/env_worker.py's group_worker_main),
+        which never calls reset() since that would incorrectly clear every
+        OTHER index's state too.
+
+        Without this, _ever_succeeded[idx] -- sticky by design, "or"-ed with
+        each step's fresh result and never reset except by reset() -- stays
+        True forever after a single early success. Every later restart of
+        that occurrence would then immediately re-report success=True
+        (and, with terminate_upon_success, immediately terminate again)
+        regardless of what actually happens, silently corrupting both the
+        success-rate metrics and, for configs using
+        GRPOConfig.advantage_source="success", the training signal itself."""
+        self._held_streak.pop(idx, None)
+        self._ever_succeeded.pop(idx, None)
 
     def get_task_description(self) -> str:
         pickup_obj_name = self.config.task_config.referral_expressions["pickup_obj_name"]
@@ -84,11 +103,11 @@ class PickTask(BaseMujocoTask):
 
         return SensorSuite(sensors)
 
-    def judge_success(self) -> bool:
-        """Judge if the task was successful (for data generation)."""
+    def judge_success(self) -> np.ndarray:
+        """Judge if the task was successful, per environment in the batch."""
 
         if self.config.task_type == "pick":
-            return self.get_info()[0]["success"]
+            return np.array([info["success"] for info in self.get_info()], dtype=bool)
         else:
             raise ValueError(f"Invalid action_type {self.config.task_type}")
 

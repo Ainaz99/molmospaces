@@ -144,7 +144,13 @@ class CameraParameterSensor(Sensor):
     def get_observation(self, env, task, batch_index: int = 0, *args, **kwargs) -> dict:
         """Get camera parameters for a specific environment."""
         camera = env.camera_manager.registry[self.camera_name]
-        world2cam = camera.get_pose()
+        # Not camera.get_pose() (reads the shared self.pos/.forward/.up
+        # mirror, whichever batch index was updated last) -- a batched
+        # render pass computes every index's pose before any is consumed
+        # (see CPUMujocoEnv.render_batch), so this index's own recorded
+        # pose must be looked up explicitly.
+        pos, forward, up = camera.get_pose_for_index(batch_index)
+        world2cam = camera.get_pose(pos=pos, forward=forward, up=up)
         # Create extrinsic_cv (Computer Vision convention - world2cam)
         extrinsic_cv = np.linalg.inv(world2cam)[:3, :]  # 3x4 matrix
         cam2world_gl = world2cam

@@ -184,7 +184,7 @@ class LastCommandedJointPosSensor(Sensor):
         self, env: BaseMujocoEnv, task: BaseMujocoTask, batch_index: int = 0, *args, **kwargs
     ):
         # sentinel done action when the task is terminal
-        if task.is_terminal():
+        if task.is_terminal()[batch_index]:
             return {}
         robot = env.robots[batch_index]
         return {k: v.tolist() for k, v in _cmd_joint_pos(robot).items()}
@@ -200,7 +200,7 @@ class LastCommandedRelativeJointPosSensor(Sensor):
         self, env: BaseMujocoEnv, task: BaseMujocoTask, batch_index: int = 0, *args, **kwargs
     ):
         # sentinel done action when the task is terminal
-        if task.is_terminal():
+        if task.is_terminal()[batch_index]:
             return {}
 
         robot = env.robots[batch_index]
@@ -232,7 +232,7 @@ class LastCommandedEEPoseSensor(Sensor):
         self, env: BaseMujocoEnv, task: BaseMujocoTask, batch_index: int = 0, *args, **kwargs
     ):
         # sentinel done action when the task is terminal
-        if task.is_terminal():
+        if task.is_terminal()[batch_index]:
             return {}
 
         robot = env.robots[batch_index]
@@ -255,7 +255,7 @@ class LastCommandedEETwistSensor(Sensor):
         self, env: BaseMujocoEnv, task: BaseMujocoTask, batch_index: int = 0, *args, **kwargs
     ):
         # sentinel done action when the task is terminal
-        if task.is_terminal():
+        if task.is_terminal()[batch_index]:
             return {}
 
         robot = env.robots[batch_index]

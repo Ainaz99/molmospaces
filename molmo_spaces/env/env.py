@@ -46,7 +46,7 @@ class BaseMujocoEnv(ABC):
 
         # Rendering state
         # TODO(anyone): can we remove these? too simple, we're on camera manager now.
-        self._renderer = None
+        self._renderers = []
         self._rgb_frame = None
         self._depth_frame = None
         self._segmentation_frame = None
@@ -142,106 +142,89 @@ class BaseMujocoEnv(ABC):
         raise NotImplementedError
 
 
-class CPUMujocoEnv(BaseMujocoEnv):
-    def __init__(
+class MujocoEnvRenderingMixin:
+    """Rendering/reset/robot-placement behavior shared by every concrete
+    `BaseMujocoEnv` backend -- extracted verbatim out of what was previously
+    all one `CPUMujocoEnv` class, with NO behavior change. All of this
+    operates purely on the `BaseMujocoEnv` surface (`self._renderer`/
+    `self.camera_manager`/`self.mj_datas`/`self.current_data`/
+    `self.current_model`/`self.object_managers`/`self._render_cache`/
+    `self._executor`) -- real forward-kinematics-derived state read off a
+    real per-index `mujoco.MjData`, never physics-stepping internals -- so
+    it's identical regardless of which backend actually advances physics.
+    `reset()` is included here too (not just rendering): it's pure CPU
+    `mj_resetData`+`mj_forward`, unrelated to which backend `step()` uses.
+
+    Deliberately NOT here: `__init__`, `_initialize_with_model`, `step()`
+    -- these differ per backend and stay defined on each concrete class.
+    """
+
+    def _prepare_render(
         self,
-        exp_config: "MlSpacesExpConfig",
-        robot_factory: Callable[[MjData], Robot],
-        mj_model: MjModel,
-        mj_base_scene_path: str,
-        parallelize: bool = True,
+        idx: int,
+        pos: np.ndarray,
+        forward: np.ndarray,
+        up: np.ndarray,
+        fov: float,
+        mode: str,
     ) -> None:
-        super().__init__(exp_config, mj_model)
+        """Sets the shared MjModel's global fov for the instant
+        mjv_updateScene needs it (fov is baked into
+        scene.camera[].frustum_top/bottom at update() time and never re-read
+        by render() -- confirmed empirically), then sets the renderer's
+        per-call MjvGLCamera pose for this idx."""
+        renderer = self._renderer
+        prev_fov = self.mj_model.vis.global_.fovy
+        self.mj_model.vis.global_.fovy = fov  # set global fov
+        # Create a camera view object (from simple_camera_test.py render_scene)
+        cam = mujoco.MjvCamera()
+        # note that passing cam to update() is not actually required, but doesn't hurt
+        cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+        renderer.update(self._mj_datas[idx], cam)
+        self.mj_model.vis.global_.fovy = prev_fov  # set global fov back -- update() already consumed it
 
-        # Store configuration for scene loading
-        self._robot_factory = robot_factory
-        self._n_batch = exp_config.task_sampler_config.task_batch_size
-        self._parallelize = parallelize
+        for camera in renderer.scene.camera:  # the for loop is necessary!
+            camera: mujoco.MjvGLCamera
+            camera.pos = pos
+            camera.forward = forward
+            camera.up = up
 
-        # Initialize empty - will be populated when scene is loaded
-        self._mj_datas = None
-        self._robots = None
-        self._executor = None
-        self._mj_base_scene_path = None
-        self._scene_metadata = None
-
-        self.camera_manager = CameraManager()
-        self._renderer: MjAbstractRenderer | None = None
-
-        self.object_managers = []
-
-        # Cached occupancy map for robot placement (expensive to create)
-        self._cached_thormap = None
-        self._cached_thormap_key = None  # (model_path, agent_radius, px_per_m)
-
-        self._initialize_with_model(mj_model, mj_base_scene_path)
-
-    def _initialize_with_model(self, mj_model: MjModel, mj_base_scene_path: str) -> None:
-        """Initialize the environment with a MuJoCo model."""
-        # Clean up old renderer if it exists (important for GPU texture cleanup when loading new scenes)
-        if self._renderer is not None:
-            self._renderer.close()
-            self._renderer = None
-
-        # Invalidate cached thormap when scene changes
-        self._cached_thormap = None
-        self._cached_thormap_key = None
-
-        # scenes
-        self._mj_model = mj_model
-        self._mj_base_scene_path = mj_base_scene_path
-        self._scene_metadata = get_scene_metadata(mj_base_scene_path)
-
-        # data for each batch
-        self._mj_datas = [MjData(mj_model) for _ in range(self._n_batch)]
-        for mj_data in self._mj_datas:
-            mujoco.mj_forward(mj_model, mj_data)
-            for _ in range(
-                self.config.task_sampler_config.sim_settle_timesteps
-            ):  # let objects settle
-                mujoco.mj_step(mj_model, mj_data)
-        self._robots = tuple(self._robot_factory(mj_data) for mj_data in self._mj_datas)
-
-        # Initialize the single renderer
-        # TODO HERE: need to set devices here
-        # likely pattern - include device in env constructor, pass to renderer here
-        if self.config.camera_config is not None:
-            width, height = self.config.camera_config.img_resolution
+        if mode == "segmentation":
+            renderer.enable_segmentation_rendering()
+        elif mode == "depth":
+            renderer.enable_depth_rendering()
         else:
-            width, height = (640, 480)  # Default resolution
-        if HAS_FILAMENT:
-            log.info("Using MuJoCo renderer: filament")
-            self._renderer = MjFilamentRenderer(model=self.mj_model, width=width, height=height)
-        else:
-            log.info("Using MuJoCo renderer: classic")
-            self._renderer = MjOpenGLRenderer(model=self.mj_model, width=width, height=height)
+            renderer.disable_segmentation_rendering()
+            renderer.disable_depth_rendering()
 
-        if self._parallelize and self._n_batch > 1:
-            self._executor = ThreadPoolExecutor(max_workers=self._n_batch)
-        else:
-            self._executor = None
+    def _execute_render(self, idx: int) -> np.ndarray:
+        """Runs the shared renderer's render() for idx. idx is unused --
+        _prepare_render already pointed the one shared renderer at idx's
+        pose/data -- kept as a parameter so callers (_render_frame,
+        render_batch) don't need a separate no-arg code path."""
+        del idx
+        return self._renderer.render()
 
-        # For now, instantiate a new ObjectManager per data
-        from molmo_spaces.env.object_manager import ObjectManager
+    def render_batch(
+        self, camera_name: str, mode: str, idxs: Collection[int]
+    ) -> dict[int, np.ndarray]:
+        """Renders one camera, one mode ("rgb"/"depth"/"segmentation"), for
+        every index in idxs, sequentially through the one shared renderer.
 
-        for idx in range(len(self._mj_datas)):
-            self.object_managers.append(ObjectManager(self, idx))
+        Caller contract: camera_manager.registry.update_all_cameras(self)
+        must already have run once per idx in idxs (with current_batch_index
+        set to that idx at the time) so camera.get_pose_for_index(idx)
+        reflects idx's own pose, not whichever idx was updated last on the
+        shared Camera object."""
+        idxs = list(idxs)
+        camera = self.camera_manager.registry[camera_name]
 
-    @property
-    def mj_datas(self) -> Sequence[MjData]:
-        if not self.is_loaded():
-            raise RuntimeError("No scene loaded. Call load_scene() first.")
-        return self._mj_datas
-
-    @property
-    def n_batch(self) -> int:
-        return self._n_batch  # This is always available (stored from constructor)
-
-    @property
-    def robots(self) -> Sequence[Robot]:
-        if not self.is_loaded():
-            raise RuntimeError("No scene loaded. Call load_scene() first.")
-        return self._robots
+        result = {}
+        for idx in idxs:
+            pos, forward, up = camera.get_pose_for_index(idx)
+            self._prepare_render(idx, pos, forward, up, camera.fov, mode)
+            result[idx] = self._execute_render(idx)
+        return result
 
     def _render_frame(
         self,
@@ -252,43 +235,23 @@ class CPUMujocoEnv(BaseMujocoEnv):
         segmentation: bool = False,
         depth: bool = False,
     ) -> np.ndarray:
-        """Helper to render a single frame using pos, forward, up vectors."""
-        if not self._renderer:
+        """Single-index synchronous render -- datagen/eval/visibility-checks/
+        robot-placement/n_batch==1 callers, unchanged behavior."""
+        if self._renderer is None:
             raise RuntimeError("Renderer not initialized. Call _initialize_with_model first.")
-
-        prev_fov = self.mj_model.vis.global_.fovy
-        self.mj_model.vis.global_.fovy = fov  # set global fov
-        # Create a camera view object (from simple_camera_test.py render_scene)
-        cam = mujoco.MjvCamera()
-        # note that passing cam to update() is not actually required, but doesn't hurt
-        cam.type = mujoco.mjtCamera.mjCAMERA_FREE
-        self._renderer.update(self.current_data, cam)
-
-        for camera in self._renderer.scene.camera:  # the for loop is necessary!
-            camera: mujoco.MjvGLCamera
-            camera.pos = pos
-            camera.forward = forward
-            camera.up = up
-
-        if segmentation:
-            self._renderer.enable_segmentation_rendering()
-            frame = self._renderer.render()
-            self._renderer.disable_segmentation_rendering()
-        elif depth:
-            self._renderer.enable_depth_rendering()
-            frame = self._renderer.render()
-            self._renderer.disable_depth_rendering()
-        else:
-            frame = self._renderer.render()
-
-        self.mj_model.vis.global_.fovy = prev_fov  # set global fov back
-        return frame
+        idx = self.current_batch_index
+        mode = "segmentation" if segmentation else ("depth" if depth else "rgb")
+        self._prepare_render(idx, pos, forward, up, fov, mode)
+        return self._execute_render(idx)
 
     def render_rgb_frame(self, camera_name: str) -> np.ndarray:
         """Renders an RGB frame from the perspective of the specified camera."""
         if camera_name not in self.camera_manager.registry:
             raise KeyError(f"Camera '{camera_name}' not found in registry.")
 
+        cached = self._render_cache.get((self.current_batch_index, camera_name, "rgb"), None)
+        if cached is not None:
+            return cached
         camera = self.camera_manager.registry[camera_name]
         return self._render_frame(
             camera.pos, camera.forward, camera.up, camera.fov, segmentation=False
@@ -306,6 +269,9 @@ class CPUMujocoEnv(BaseMujocoEnv):
         if camera_name not in self.camera_manager.registry:
             raise KeyError(f"Camera '{camera_name}' not found in registry.")
 
+        cached = self._render_cache.get((self.current_batch_index, camera_name, "depth"), None)
+        if cached is not None:
+            return cached.astype(np.float32)
         camera = self.camera_manager.registry[camera_name]
         depth_frame = self._render_frame(
             camera.pos, camera.forward, camera.up, camera.fov, depth=True
@@ -319,10 +285,28 @@ class CPUMujocoEnv(BaseMujocoEnv):
         if camera_name not in self.camera_manager.registry:
             raise KeyError(f"Camera '{camera_name}' not found in registry.")
 
+        cached = self._render_cache.get((self.current_batch_index, camera_name, "segmentation"), None)
+        if cached is not None:
+            return cached
         camera = self.camera_manager.registry[camera_name]
         return self._render_frame(
             camera.pos, camera.forward, camera.up, camera.fov, segmentation=True
         )
+
+    def clear_render_cache(self) -> None:
+        """Drops any render_batch results never consumed by a matching
+        render_*_frame call this round (e.g. a sensor that wasn't in the
+        SensorSuite.render_requests() enumeration) -- called at the end of
+        BaseMujocoTask.get_observations() so a stale frame never leaks into
+        a later round's cache lookup for the same (idx, camera_name, mode)."""
+        self._render_cache.clear()
+
+    def mark_all_textures_dirty(self) -> None:
+        """Marks the shared renderer's texture cache dirty after scene
+        texture randomization, so the next render re-uploads instead of
+        using stale pre-randomization textures."""
+        if self._renderer is not None and hasattr(self._renderer, "mark_textures_dirty"):
+            self._renderer.mark_textures_dirty()
 
     def get_camera_parameters(self, camera_name: str) -> dict:
         """Get camera parameters for a specific camera."""
@@ -364,9 +348,10 @@ class CPUMujocoEnv(BaseMujocoEnv):
 
     def cleanup_rendering(self) -> None:
         """Clean up rendering resources."""
-        if self._renderer:
+        if self._renderer is not None:
             self._renderer.close()
-            self._renderer = None
+        self._renderer = None
+        self._render_cache = {}
 
     def _reset_single(self, idx: int) -> None:
         mujoco.mj_resetData(self._mj_model, self._mj_datas[idx])
@@ -382,24 +367,6 @@ class CPUMujocoEnv(BaseMujocoEnv):
         else:
             for idx in idxs:
                 self._reset_single(idx)
-
-    def step(self, n_steps: int = 1) -> None:
-        if self._executor is not None:
-            futures = [
-                self._executor.submit(mujoco.mj_step, self._mj_model, mj_data, n_steps)
-                for mj_data in self._mj_datas
-            ]
-            for future in as_completed(futures):
-                future.result()
-        else:
-            for mj_data in self._mj_datas:
-                mujoco.mj_step(self._mj_model, mj_data, n_steps)
-
-        # We got new scene state, so anything depending on data must be refreshed
-        for om in self.object_managers:
-            om.invalidate_data_cache()
-
-        self.camera_manager.registry.update_all_cameras(self)
 
     def segmentation_fraction(self, seg: np.ndarray, body_name_or_id: str | int) -> float:
         """Calculate visibility of a body in the segmentation image."""
@@ -719,7 +686,7 @@ class CPUMujocoEnv(BaseMujocoEnv):
         if "ithor" in self.current_model_path:
             model_path = Path(self.current_model_path.replace("_ceiling", ""))
             precomputed_map = model_path.parent / f"{model_path.stem}_map.png"
-            if precomputed_map.is_file():
+            if precomputed_map.is_file() and not self.config.no_cached_map:
                 thormap = iTHORMap.load(
                     path=precomputed_map.as_posix(),
                     agent_radius=agent_radius,
@@ -735,7 +702,7 @@ class CPUMujocoEnv(BaseMujocoEnv):
         elif "procthor" in self.current_model_path or "holodeck" in self.current_model_path:
             model_path = Path(self.current_model_path.replace("_ceiling", ""))
             precomputed_map = model_path.parent / f"{model_path.stem}_map.png"
-            if precomputed_map.is_file():
+            if precomputed_map.is_file() and not self.config.no_cached_map:
                 thormap = ProcTHORMap.load(
                     path=precomputed_map.as_posix(),
                     agent_radius=agent_radius,
@@ -1055,3 +1022,154 @@ class CPUMujocoEnv(BaseMujocoEnv):
 
     def __del__(self) -> None:
         self.close()
+
+
+class CPUMujocoEnv(MujocoEnvRenderingMixin, BaseMujocoEnv):
+    def __init__(
+        self,
+        exp_config: "MlSpacesExpConfig",
+        robot_factory: Callable[[MjData], Robot],
+        mj_model: MjModel,
+        mj_base_scene_path: str,
+        parallelize: bool = True,
+    ) -> None:
+        super().__init__(exp_config, mj_model)
+
+        # Store configuration for scene loading
+        self._robot_factory = robot_factory
+        self._n_batch = exp_config.task_sampler_config.task_batch_size
+        self._parallelize = parallelize
+
+        # Initialize empty - will be populated when scene is loaded
+        self._mj_datas = None
+        self._robots = None
+        self._executor = None
+        self._mj_base_scene_path = None
+        self._scene_metadata = None
+
+        self.camera_manager = CameraManager()
+        # A single renderer, shared and reused sequentially across every
+        # batch index. Do not parallelize this across per-index renderer
+        # threads: two threads issuing GL calls into the driver at the same
+        # time -- even from fully independent EGL contexts, each correctly
+        # pinned to its own thread -- can abort or hang the process outright
+        # on real NVIDIA hardware. One renderer, always used from whatever
+        # thread calls render_batch/render_*_frame, is the only pattern
+        # proven stable here.
+        self._renderer: MjAbstractRenderer | None = None
+        # Populated by render_batch, consumed (and cleared) by
+        # render_rgb_frame/render_depth_frame/render_segmentation_frame --
+        # avoids re-rendering a frame render_batch already computed for
+        # this (batch_index, camera_name, mode).
+        self._render_cache: dict[tuple[int, str, str], np.ndarray] = {}
+
+        self.object_managers = []
+
+        # Cached occupancy map for robot placement (expensive to create)
+        self._cached_thormap = None
+        self._cached_thormap_key = None  # (model_path, agent_radius, px_per_m)
+
+        self._initialize_with_model(mj_model, mj_base_scene_path)
+
+    def _initialize_with_model(self, mj_model: MjModel, mj_base_scene_path: str) -> None:
+        """Initialize the environment with a MuJoCo model."""
+        # Clean up old renderers if they exist (important for GPU texture cleanup when loading new scenes)
+        self.cleanup_rendering()
+
+        # Invalidate cached thormap when scene changes
+        self._cached_thormap = None
+        self._cached_thormap_key = None
+
+        # scenes
+        self._mj_model = mj_model
+        self._mj_base_scene_path = mj_base_scene_path
+        self._scene_metadata = get_scene_metadata(mj_base_scene_path)
+
+        # Constructed before the settle loop below so that loop can also use
+        # it: settling every batch index's MjData sequentially costs n_batch
+        # times one index's wall-clock (measured ~130s at n_batch=8 vs ~16s
+        # at n_batch=1 on a real house scene), even though independent
+        # MjData objects sharing one MjModel step embarrassingly in
+        # parallel -- exactly what step() already does for regular stepping.
+        if self._parallelize and self._n_batch > 1:
+            self._executor = ThreadPoolExecutor(max_workers=self._n_batch)
+        else:
+            self._executor = None
+
+        def _settle(mj_data: MjData) -> None:
+            mujoco.mj_forward(mj_model, mj_data)
+            for _ in range(
+                self.config.task_sampler_config.sim_settle_timesteps
+            ):  # let objects settle
+                mujoco.mj_step(mj_model, mj_data)
+
+        # data for each batch
+        self._mj_datas = [MjData(mj_model) for _ in range(self._n_batch)]
+        if self._executor is not None:
+            futures = [self._executor.submit(_settle, mj_data) for mj_data in self._mj_datas]
+            for future in as_completed(futures):
+                future.result()
+        else:
+            for mj_data in self._mj_datas:
+                _settle(mj_data)
+        self._robots = tuple(self._robot_factory(mj_data) for mj_data in self._mj_datas)
+
+        # Initialize a single renderer, shared across every batch index.
+        # TODO HERE: need to set devices here
+        # likely pattern - include device in env constructor, pass to renderer here
+        if self.config.camera_config is not None:
+            width, height = self.config.camera_config.img_resolution
+        else:
+            width, height = (640, 480)  # Default resolution
+        renderer_cls = MjFilamentRenderer if HAS_FILAMENT else MjOpenGLRenderer
+        log.info(f"Using MuJoCo renderer: {'filament' if HAS_FILAMENT else 'classic'}")
+        self._renderer = renderer_cls(model=self.mj_model, width=width, height=height)
+
+        # For now, instantiate a new ObjectManager per data
+        from molmo_spaces.env.object_manager import ObjectManager
+
+        for idx in range(len(self._mj_datas)):
+            self.object_managers.append(ObjectManager(self, idx))
+
+    @property
+    def mj_datas(self) -> Sequence[MjData]:
+        if not self.is_loaded():
+            raise RuntimeError("No scene loaded. Call load_scene() first.")
+        return self._mj_datas
+
+    @property
+    def n_batch(self) -> int:
+        return self._n_batch  # This is always available (stored from constructor)
+
+    @property
+    def robots(self) -> Sequence[Robot]:
+        if not self.is_loaded():
+            raise RuntimeError("No scene loaded. Call load_scene() first.")
+        return self._robots
+
+    def step(self, n_steps: int = 1, idxs: Collection[int] | None = None) -> None:
+        """idxs: physically advance only these batch indices (default: all).
+        For a group-batched task where one index was just placed at a fresh
+        episode start (see RBY1PickReplayTaskSampler.reset_pending_episode_at_index)
+        while its groupmates are mid-episode, that index must not be stepped
+        alongside them with an action that was never meant for its reset
+        state -- mirrors reset()'s existing idxs parameter."""
+        if idxs is None:
+            idxs = range(self.n_batch)
+        mj_datas = [self._mj_datas[idx] for idx in idxs]
+        if self._executor is not None:
+            futures = [
+                self._executor.submit(mujoco.mj_step, self._mj_model, mj_data, n_steps)
+                for mj_data in mj_datas
+            ]
+            for future in as_completed(futures):
+                future.result()
+        else:
+            for mj_data in mj_datas:
+                mujoco.mj_step(self._mj_model, mj_data, n_steps)
+
+        # We got new scene state, so anything depending on data must be refreshed
+        for idx in idxs:
+            self.object_managers[idx].invalidate_data_cache()
+
+        self.camera_manager.registry.update_all_cameras(self)

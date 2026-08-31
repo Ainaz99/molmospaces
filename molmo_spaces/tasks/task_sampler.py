@@ -720,7 +720,7 @@ class BaseMujocoTaskSampler:
             scene_path = self._current_house_scene_path()
 
         # If using a MolmoSpaces scene, install it
-        if get_scenes_root().resolve() in Path(scene_path).resolve().parents:
+        if True: #get_scenes_root().resolve() in Path(scene_path).resolve().parents:
             # Track asset installation time (fetching/extracting scene, objects, grasps)
             # Use detailed profiling to identify which asset type is slow
             if self._datagen_profiler is not None:
@@ -1006,9 +1006,8 @@ class BaseMujocoTaskSampler:
                 )
 
             # Mark textures as dirty so they will be uploaded to GPU on next render
-            if hasattr(env, "_renderer") and env._renderer is not None:
-                if hasattr(env._renderer, "mark_textures_dirty"):
-                    env._renderer.mark_textures_dirty()
+            if hasattr(env, "mark_all_textures_dirty"):
+                env.mark_all_textures_dirty()
             if self._datagen_profiler is not None:
                 self._datagen_profiler.end("randomize_texture")
             log.info("Texture randomization completed.\n")

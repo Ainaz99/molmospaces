@@ -50,18 +50,52 @@ class Camera:
             up if up is not None else np.array([0.0, 0.0, 1.0], dtype=np.float32)
         )
         self.fov: float = fov
+        # Per-batch-index pose, alongside (not instead of) self.pos/.forward/
+        # .up above: a batched CPUMujocoEnv (n_batch > 1) computes every
+        # index's pose before any of them is consumed (see
+        # CPUMujocoEnv.render_batch), so a single shared self.pos/.forward/
+        # .up would silently return whichever index was updated last to
+        # every other index's reader (CameraParameterSensor in particular).
+        # self.pos/.forward/.up are still kept in sync (see _set_pose) as the
+        # "last written" mirror single-index callers already rely on.
+        self._poses_by_index: dict[int, tuple[NDArray, NDArray, NDArray]] = {}
 
     def update_pose(self, env: CPUMujocoEnv) -> bool:
         """Update camera pose. Returns True if pose changed, False otherwise."""
         return False  # by default cameras don't update
 
-    def get_pose(self) -> NDArray[np.float32]:
+    def get_pose_for_index(self, idx: int) -> tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]:
+        """(pos, forward, up) as last set for batch index `idx`. Falls back
+        to the shared self.pos/.forward/.up for a camera that never recorded
+        a per-index pose -- correct for a static (non-robot-mounted) camera,
+        whose pose is identical across every batch index by construction."""
+        return self._poses_by_index.get(idx, (self.pos, self.forward, self.up))
+
+    def _set_pose(
+        self, idx: int, pos: NDArray[np.float32], forward: NDArray[np.float32], up: NDArray[np.float32]
+    ) -> None:
+        self.pos, self.forward, self.up = pos, forward, up
+        self._poses_by_index[idx] = (pos, forward, up)
+
+    def get_pose(
+        self,
+        pos: NDArray[np.float32] | None = None,
+        forward: NDArray[np.float32] | None = None,
+        up: NDArray[np.float32] | None = None,
+    ) -> NDArray[np.float32]:
         """
-        return 4x4 pose
+        return 4x4 pose. pos/forward/up default to self.pos/.forward/.up
+        (unchanged single-index behavior); pass explicit values (e.g. from
+        get_pose_for_index(idx)) to compute a specific batch index's pose
+        without depending on which index was written to self.* last.
         """
+        pos = self.pos if pos is None else pos
+        forward = self.forward if forward is None else forward
+        up = self.up if up is None else up
+
         # Validate and normalize camera vectors
-        forward_norm = np.linalg.norm(self.forward)
-        up_norm = np.linalg.norm(self.up)
+        forward_norm = np.linalg.norm(forward)
+        up_norm = np.linalg.norm(up)
 
         if forward_norm < 1e-6 or up_norm < 1e-6:
             print(
@@ -69,8 +103,8 @@ class Camera:
             )
             return np.eye(4, 4, dtype=np.float32)
 
-        forward = self.forward / forward_norm
-        up = self.up / up_norm
+        forward = forward / forward_norm
+        up = up / up_norm
         right = np.cross(forward, up)
 
         right_norm = np.linalg.norm(right)
@@ -88,7 +122,7 @@ class Camera:
         world2cam[:3, 0] = right  # X-axis (right)
         world2cam[:3, 1] = -up  # Y-axis (up)
         world2cam[:3, 2] = forward  # Z-axis - camera looks down negative Z
-        world2cam[:3, 3] = self.pos  # Translation
+        world2cam[:3, 3] = pos  # Translation
         return world2cam
 
 
@@ -193,10 +227,8 @@ class RobotMountedCamera(Camera):
                 self.up_axis,
             )
 
-        # Update our pose
-        self.pos = pos
-        self.forward = forward
-        self.up = up
+        # Update our pose (per batch index -- see Camera._set_pose)
+        self._set_pose(env.current_batch_index, pos, forward, up)
 
         # Cache the reference pose
         self._last_reference_pose = current_reference_pose

@@ -17,6 +17,7 @@
 import atexit
 import ctypes
 import os
+import threading
 
 PYOPENGL_PLATFORM = os.environ.get("PYOPENGL_PLATFORM")
 
@@ -114,6 +115,16 @@ os.environ["PYOPENGL_PLATFORM"] = "egl"
 # Global EGL display that is shared across all contexts
 EGL_DISPLAY = None
 EGL_DISPLAY_INITIALIZED = False
+# Guards the check-and-set below -- concurrent first-time construction of two
+# EGLGLContexts would otherwise race on EGL_DISPLAY_INITIALIZED. Construct
+# contexts sequentially where possible regardless: concurrent EGL context
+# *creation* (not just this check) measurably contends at the driver level,
+# and two threads issuing GL calls into the driver at the same time -- even
+# from fully independent, correctly thread-pinned contexts -- can abort or
+# hang the process outright on real NVIDIA hardware. This lock is
+# defense-in-depth against the check-and-set race; it doesn't make
+# concurrent rendering itself safe.
+_EGL_DISPLAY_LOCK = threading.Lock()
 
 
 class EGLGLContext:
@@ -128,17 +139,18 @@ class EGLGLContext:
         config = EGL.EGLConfig()
         EGL.eglReleaseThread()
 
-        if not EGL_DISPLAY_INITIALIZED:
-            # only initialize for the first time
-            EGL_DISPLAY = create_initialized_egl_device_display(device_id=device_id)
-            if EGL_DISPLAY == EGL.EGL_NO_DISPLAY:
-                raise ImportError(
-                    "Cannot initialize a EGL device display. This likely means that your EGL "
-                    "driver does not support the PLATFORM_DEVICE extension, which is "
-                    "required for creating a headless rendering context."
-                )
-            atexit.register(EGL.eglTerminate, EGL_DISPLAY)
-            EGL_DISPLAY_INITIALIZED = True
+        with _EGL_DISPLAY_LOCK:
+            if not EGL_DISPLAY_INITIALIZED:
+                # only initialize for the first time
+                EGL_DISPLAY = create_initialized_egl_device_display(device_id=device_id)
+                if EGL_DISPLAY == EGL.EGL_NO_DISPLAY:
+                    raise ImportError(
+                        "Cannot initialize a EGL device display. This likely means that your EGL "
+                        "driver does not support the PLATFORM_DEVICE extension, which is "
+                        "required for creating a headless rendering context."
+                    )
+                atexit.register(EGL.eglTerminate, EGL_DISPLAY)
+                EGL_DISPLAY_INITIALIZED = True
         EGL.eglChooseConfig(
             EGL_DISPLAY, EGL_ATTRIBUTES, ctypes.byref(config), config_size, num_configs
         )
