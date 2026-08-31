@@ -1,4 +1,5 @@
 import os
+import sys
 from queue import Queue
 from typing import Any, Literal
 
@@ -106,6 +107,27 @@ class MjOpenGLRenderer(MjAbstractRenderer):
         model = model_bindings.model if model_bindings is not None else model
         self._model = model
 
+
+        # VRAM: this codebase's scene XMLs bake in shadowsize=16384 (a
+        # shadowsize^2 depth texture allocated PER MjrContext -- pure VRAM,
+        # 16384^2 * 4B = 1024 MiB/context for a scene with one shadow-casting
+        # light) and never override MSAA/offsamples away from MuJoCo's own
+        # default of 4 -- since mjr_readPixels resolves MSAA by averaging
+        # (which corrupts segmentation ID colors and depth at edges),
+        # depth/segmentation reads force render() to lazily build a WHOLE
+        # SECOND MjrContext the first time either is used: +1592 MiB.
+        # Together, ~3.3 GiB/renderer -- matches a sibling codebase (a
+        # separate molmospaces fork used for datagen) that already measured
+        # and fixed exactly this: 3303 -> 479 MiB/context from these same
+        # two numbers. Every scene reset here rebuilds the renderer from
+        # scratch (see env.py's cleanup_rendering()), so a worker that
+        # retries a few episodes before landing a good one can stack
+        # several renderers' worth of this into one process's VRAM
+        # footprint. Must be set before MjrContext is built below -- that's
+        # what actually allocates these buffers.
+        model.vis.quality.shadowsize = 4096
+        model.vis.quality.offsamples = 0
+
         self._scene = MjvScene(model=model, maxgeom=max_geom)
         self._scene_option = MjvOption()
 
@@ -122,7 +144,14 @@ class MjOpenGLRenderer(MjAbstractRenderer):
             from mujoco import gl_context
 
             self._gl_context = gl_context.GLContext(width, height)  # type: ignore
-            self._context_is_cgl = True
+            # gl_context.GLContext dispatches on MUJOCO_GL/platform: it is CGL
+            # only on macOS, and OSMesa or GLFW on Linux. Marking it CGL
+            # unconditionally made the CGLUnlockContext calls in free() below
+            # dlopen a macOS framework path, which is how a CPU-only Linux box
+            # (no CUDA -> device_id stays None) died with "/System/Library/
+            # Frameworks/OpenGL.framework/OpenGL: cannot open shared object
+            # file" instead of rendering through OSMesa.
+            self._context_is_cgl = sys.platform == "darwin"
         else:
             from molmo_spaces.renderer.opengl_context import EGLGLContext
 
@@ -457,12 +486,31 @@ class MjOpenGLRenderer(MjAbstractRenderer):
           # Use renderer.
         ```
         """
-        if hasattr(self, "_gl_context") and self._gl_context:
-            self._gl_context.free()
-        self._gl_context = None
+        # ORDER MATTERS. MjrContext.free() is mjr_freeContext, which issues
+        # OpenGL calls (glDeleteTextures/glDeleteFramebuffers/
+        # glDeleteRenderbuffers) and therefore needs a CURRENT GL context.
+        # Freeing the GL context first -- as this used to do -- leaves those
+        # deletes with no context to act on, so every texture and
+        # framebuffer this renderer owned leaks for the lifetime of the
+        # process. env.py's _initialize_with_model() calls this on every
+        # scene load specifically "for GPU texture cleanup", so on the RL
+        # replay path (a fresh scene most resets) that was one house's worth
+        # of textures leaked per reset.
+        gl = getattr(self, "_gl_context", None)
+        if gl:
+            try:
+                gl.make_current()
+            except Exception:  # noqa: BLE001 -- interpreter teardown via __del__
+                gl = None
         if hasattr(self, "_mjr_context") and self._mjr_context:
-            self._mjr_context.free()
+            try:
+                self._mjr_context.free()
+            except Exception:  # noqa: BLE001
+                pass
         self._mjr_context = None
+        if gl:
+            gl.free()
+        self._gl_context = None
 
     def __enter__(self):
         return self
