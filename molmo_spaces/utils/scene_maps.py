@@ -82,6 +82,155 @@ def _delete_blacklisted_bodies(spec: mujoco.MjSpec) -> int:
     return len(bodies_to_delete)
 
 
+def _parse_room_id(name: str) -> int | None:
+    """Parse the room id encoded in a house body/wall name.
+
+    Follows the two house-naming conventions from housegen:
+    - Furniture/objects: ``"{lemma}_{hash}_{count}_{body_idx}_{room_id}"``
+      (``housegen.utils.generate_body_name``) -- room id is the last token.
+    - Walls: ``"wall_{room_id}_{count}"`` (``housegen.builder.add_wall``) --
+      room id is the second token.
+
+    Returns None for anything that doesn't match either convention (robot
+    bodies, lights, and other non-room-tagged elements) so callers can treat
+    those conservatively (e.g. never prune what they can't attribute to a
+    room).
+    """
+    if not name:
+        return None
+    parts = name.split("_")
+    if len(parts) >= 3 and parts[0] == "wall":
+        candidate = parts[1]
+    elif len(parts) >= 5:
+        candidate = parts[-1]
+    else:
+        return None
+    return int(candidate) if candidate.lstrip("-").isdigit() else None
+
+
+def _prune_bodies_outside_targets(
+    spec: mujoco.MjSpec,
+    targets: list[tuple[str, np.ndarray]],
+    radius: float,
+    keep_name_prefixes: tuple[str, ...] = ("robot_",),
+) -> int:
+    """Delete top-level house bodies that are neither in the same room as
+    any of `targets` nor within `radius` of one, to shrink a house's MjSpec
+    down to the region a local-manipulation task actually needs before
+    compilation.
+
+    Args:
+        spec: The MuJoCo spec to modify in-place.
+        targets: (body_name, world_xy_center) pairs -- e.g. every pickup
+            object's name and position that could ever matter for the house
+            currently being loaded. Room id is parsed from each name via
+            `_parse_room_id`; a target whose name doesn't parse contributes
+            only its radius, not a kept room.
+        radius: Bodies outside every kept room are still kept if within this
+            distance (meters, XY-plane) of any target center -- this covers
+            open-plan boundaries where a strict room cut would leave a
+            visible gap.
+        keep_name_prefixes: Body names starting with any of these are never
+            deleted regardless of room/distance (e.g. the robot).
+
+    Returns:
+        Number of bodies deleted.
+    """
+    room_ids = {rid for name, _ in targets if (rid := _parse_room_id(name)) is not None}
+    centers = [np.asarray(center[:2], dtype=float) for _, center in targets]
+
+    bodies_to_delete = []
+    for body in spec.worldbody.bodies:
+        name = body.name or ""
+        if any(name.startswith(prefix) for prefix in keep_name_prefixes):
+            continue
+        rid = _parse_room_id(name)
+        if rid is None or rid in room_ids:
+            continue
+        pos_xy = np.asarray(body.pos[:2], dtype=float)
+        if any(np.linalg.norm(pos_xy - center) <= radius for center in centers):
+            continue
+        bodies_to_delete.append(body)
+
+    for body in bodies_to_delete:
+        spec.delete(body)
+
+    if bodies_to_delete:
+        log.info(f"[house prune] deleted {len(bodies_to_delete)} out-of-room bodies")
+
+    return len(bodies_to_delete)
+
+
+def _prune_orphaned_assets(spec: mujoco.MjSpec) -> int:
+    """Delete mesh/material/texture spec entries no longer referenced by any
+    surviving geom.
+
+    MuJoCo's compiler does not tree-shake unreferenced `<mesh>`/`<texture>`/
+    `<material>` spec entries on its own, so after deleting bodies (e.g. via
+    `_prune_bodies_outside_targets`), their assets must be removed
+    explicitly or none of the RAM they occupy is actually freed.
+
+    Returns:
+        Number of mesh/material/texture spec entries deleted.
+    """
+    referenced_meshes: set[str] = set()
+    referenced_materials: set[str] = set()
+
+    def visit(body: mujoco.MjsBody) -> None:
+        for geom in body.geoms:
+            if geom.meshname:
+                referenced_meshes.add(geom.meshname)
+            if geom.material:
+                referenced_materials.add(geom.material)
+        for child in body.bodies:
+            visit(child)
+
+    visit(spec.worldbody)
+
+    referenced_textures: set[str] = set()
+    for material in spec.materials:
+        if material.name not in referenced_materials:
+            continue
+        for tex_name in material.textures:
+            if tex_name:
+                referenced_textures.add(tex_name)
+
+    # Select victims by NAME first (only ever considering non-empty names --
+    # spec.mesh("")/material("")/texture("") is not a reliable "find the
+    # unnamed one" lookup: on a real house scene with an unnamed mesh
+    # present, calling spec.delete(spec.mesh("")) corrupted an unrelated,
+    # still-referenced mesh ('base_1', still live in geom.meshname) out of
+    # the spec, later surfacing as spec.compile() failing with "mesh
+    # 'base_1' not found in geom 1". Unnamed assets are simply left alone --
+    # we can't safely address one by name, so we don't try to delete it.
+    mesh_names_to_delete = [m.name for m in spec.meshes if m.name and m.name not in referenced_meshes]
+    material_names_to_delete = [
+        m.name for m in spec.materials if m.name and m.name not in referenced_materials
+    ]
+    texture_names_to_delete = [
+        t.name for t in spec.textures if t.name and t.name not in referenced_textures
+    ]
+
+    for name in mesh_names_to_delete:
+        handle = spec.mesh(name)
+        if handle is not None:
+            spec.delete(handle)
+    for name in material_names_to_delete:
+        handle = spec.material(name)
+        if handle is not None:
+            spec.delete(handle)
+    for name in texture_names_to_delete:
+        handle = spec.texture(name)
+        if handle is not None:
+            spec.delete(handle)
+
+    n_deleted = len(mesh_names_to_delete) + len(material_names_to_delete) + len(texture_names_to_delete)
+    if n_deleted:
+        log.info(f"[house prune] deleted {n_deleted} orphaned mesh/material/texture assets")
+
+    return n_deleted
+
+
 def _handle_compile_error_and_blacklist(error: Exception) -> None:
     """Parse MuJoCo compile error and add problematic asset to static blacklist.
 

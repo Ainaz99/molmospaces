@@ -18,7 +18,6 @@ from typing import Any
 
 import mujoco
 import numpy as np
-import torch
 from mujoco import MjData, MjSpec
 
 from molmo_spaces.configs.abstract_exp_config import MlSpacesExpConfig
@@ -420,7 +419,17 @@ class BaseMujocoTaskSampler:
         self.current_seed = seed
         random.seed(seed)
         np.random.seed(seed)
-        torch.manual_seed(seed)
+        # Skippable: MOLMOSPACES_NO_TORCH (see policy_configs.py and
+        # morpheus/rl/env_worker.py) marks a process -- a CPU-only RL rollout
+        # worker -- that never creates a single torch tensor, so seeding
+        # torch's global RNG here would only cost ~400MB RSS at import time
+        # for no benefit. This is called from __init__, unconditionally, so
+        # a lazy import alone (deferring torch to first use) wouldn't have
+        # saved anything -- every instance hits this line immediately anyway.
+        if not os.environ.get("MOLMOSPACES_NO_TORCH"):
+            import torch
+
+            torch.manual_seed(seed)
 
     def _create_robot(self, mj_data: MjData) -> Robot:
         return self.config.robot_config.robot_factory(mj_data, self.config)
@@ -640,9 +649,24 @@ class BaseMujocoTaskSampler:
             self._datagen_profiler.start("compile_mujoco")
 
         # Delete blacklisted bodies before compilation to prevent mass/inertia errors
-        from molmo_spaces.utils.scene_maps import _delete_blacklisted_bodies
+        from molmo_spaces.utils.scene_maps import (
+            _delete_blacklisted_bodies,
+            _prune_bodies_outside_targets,
+            _prune_orphaned_assets,
+        )
 
         _delete_blacklisted_bodies(spec)
+
+        # Crop the house down to the room(s) this task actually needs, for
+        # local-manipulation tasks where most of a multi-room house is never
+        # touched. Opt-in per task_sampler_config; see get_house_prune_targets.
+        if getattr(self.config.task_sampler_config, "prune_house_to_room", False):
+            prune_targets = self.get_house_prune_targets()
+            if prune_targets:
+                radius = getattr(self.config.task_sampler_config, "prune_crop_radius_m", 3.0)
+                n_pruned = _prune_bodies_outside_targets(spec, prune_targets, radius)
+                if n_pruned:
+                    _prune_orphaned_assets(spec)
 
         # Compile and return the model
         try:
@@ -690,6 +714,27 @@ class BaseMujocoTaskSampler:
         """Add add auxiliary objects to  a scene or make task specific model changes
         This gives access to the MjSpec pre-compilation."""
         pass
+
+    def get_house_prune_targets(self) -> list[tuple[str, np.ndarray]] | None:
+        """Override to enable `task_sampler_config.prune_house_to_room`: return
+        (body_name, world_xy_center) pairs for every location that must stay
+        reachable when the house currently being loaded is pruned down to
+        the room(s) it needs (see `scene_maps._prune_bodies_outside_targets`).
+        Room id is parsed from each `body_name` via `scene_maps._parse_room_id`.
+
+        Default is None, i.e. pruning is a no-op even if the config flag is
+        set -- a sampler must opt in explicitly by overriding this.
+
+        IMPORTANT: this house's compiled MjModel is reused across every task
+        sampled against it until a different house is requested (see
+        `_last_loaded_house_index` in `sample_task`) -- `randomize_scene`
+        only repositions bodies, it never recompiles. The returned targets
+        must therefore cover every task that could run against this house
+        while it stays loaded, not just the one currently pending, or a
+        later task's target could get pruned away and be skipped as
+        HouseInvalidForTask.
+        """
+        return None
 
     def setup_empty_materials(
         self, spec: mujoco.MjSpec | None = None, num_materials: int = 200

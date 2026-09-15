@@ -124,6 +124,15 @@ class PickTaskSamplerConfig(ObjectCentricTaskSamplerConfig):
         0.7,
     )  # Radius to sample robot base pose around receptacle
 
+    # House pruning: pick is a local, single-room task (robot base is placed
+    # within max_robot_to_obj_dist of the pickup object and never navigates),
+    # so most of a multi-room house is never touched. When enabled, bodies
+    # belonging to other rooms (and their now-unreferenced meshes/textures)
+    # are deleted from the MjSpec before compilation, cutting per-worker
+    # MjModel RAM. See BaseMujocoTaskSampler.setup_robot_scene.
+    prune_house_to_room: bool = False
+    prune_crop_radius_m: float = 3.0  # keep bodies within this radius even if outside the target room (avoids visual cliffs at open-plan room boundaries)
+
     # -- Added pickup objects (pick-from-set mode) --
     # When not None, external objects matching these synsets/categories/UIDs are added to the
     # scene and used as pickup targets instead of the scene's own objects (which serve only as

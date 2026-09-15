@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -11,11 +12,27 @@ from molmo_spaces.planner.astar_planner import AStarPlannerConfig
 from molmo_spaces.policy.base_policy import BasePolicy, PolicyFactory
 from molmo_spaces.utils.function_utils import make_lenient
 
-# Import CuroboPlannerConfig if available (requires GPU), otherwise create a stub
-try:
-    from molmo_spaces.planner.curobo_planner import CuroboPlannerConfig
-except (ImportError, RuntimeError):
-    # Create a stub class when CuRobo isn't available (e.g., on non-GPU nodes)
+# Import CuroboPlannerConfig if available (requires GPU), otherwise create a
+# stub. curobo_planner.py itself imports torch + curobo (~400MB RSS) at
+# module level, so this "if available" check alone doesn't help on a machine
+# where they're both installed -- it always succeeds there, whether or not
+# the importing process will ever actually plan anything (e.g. an RL rollout
+# env-worker process, which only replays/executes already-computed action
+# chunks and never touches a planner). MOLMOSPACES_NO_TORCH (see
+# morpheus/rl/env_worker.py, the only current setter) lets such a process opt
+# out of the real import and take the stub unconditionally, without changing
+# behavior for anything that doesn't set it.
+if os.environ.get("MOLMOSPACES_NO_TORCH"):
+    _curobo_available = False
+else:
+    try:
+        from molmo_spaces.planner.curobo_planner import CuroboPlannerConfig
+
+        _curobo_available = True
+    except (ImportError, RuntimeError):
+        _curobo_available = False
+
+if not _curobo_available:
     # This allows Pydantic to resolve forward references during config validation
     if TYPE_CHECKING:
         from molmo_spaces.planner.curobo_planner import CuroboPlannerConfig

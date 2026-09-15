@@ -13,11 +13,6 @@ from tqdm import tqdm
 
 from molmo_spaces.utils.lazy_loading_utils import UserAssetLibraryIndexEntry, get_user_library_index
 
-try:
-    import open_clip
-except ImportError:
-    print("Try `pip install open-clip-torch` for open_clip")
-
 from molmospaces_resources import PickleLMDBMap
 
 from molmo_spaces.molmo_spaces_constants import (
@@ -62,6 +57,16 @@ def get_clip_model():
     global _CLIP
 
     if _CLIP is None:
+        # Deferred: this module is imported by every RL env worker process
+        # (via task_sampler.py) for unrelated metadata helpers, but only this
+        # function actually needs open_clip -- and it pulls in torch +
+        # transformers + timm, ~1GB RSS, in processes rollout_collector.py's
+        # docstring assumes are "CPU-only ... no torch/CUDA".
+        try:
+            import open_clip
+        except ImportError:
+            print("Try `pip install open-clip-torch` for open_clip")
+            raise
         clip_model, _, clip_preprocess = open_clip.create_model_and_transforms(
             DEFAULT_CLIP_MODEL, pretrained=DEFAULT_CLIP_PRETRAIN, device=DEFAULT_DEVICE
         )

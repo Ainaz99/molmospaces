@@ -1242,7 +1242,7 @@ class ObjectManager:
                     try:
                         task_object = create_mlspaces_body(self.data, object_name)
                     except KeyError:
-                        log.warning("Could not find object %s in scene", object_name)
+                        log.debug("Could not find object %s in scene", object_name)
                         continue
                     task_objects.append(task_object)
 
